@@ -115,6 +115,8 @@ struct MockTargetProfile {
   // allows programming into fully erased flash words of that byte size
   // (ECC rule: a flash word must never be programmed twice).
   uint32_t flashWordSize = 0;
+  // F103 FPEC only accepts even addresses/sizes. Independent of H7 ECC rules.
+  uint32_t programAlignment = 1;
   // When true, C_STEP re-halts and advances PC without latching S_RETIRE_ST.
   // Models STM32H723 / Cortex-M7 hardware observed during source stepping.
   bool omitStepRetireSticky = false;

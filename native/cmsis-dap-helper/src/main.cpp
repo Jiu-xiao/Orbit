@@ -939,11 +939,16 @@ std::string handleReadMemoryBatch(const JsonValue& params, Channel& channel) {
   auto safeScalar = [&reads](size_t index) {
     return reads[index].size == 4 && (reads[index].address & 0x03u) == 0;
   };
+  const size_t packedWordLimit = target.maxScatteredReadsPerPacket();
+  auto smallAlignedRange = [&reads, packedWordLimit](size_t index) {
+    return (reads[index].address & 0x03u) == 0 && (reads[index].size & 0x03u) == 0 &&
+           reads[index].size / 4u <= packedWordLimit;
+  };
   auto contiguousRunEnd = [&reads](size_t start) {
     size_t end = start + 1;
     while (end < reads.size() && reads[end].size == 4 &&
            (reads[end].address & 0x03u) == 0 &&
-           reads[end].address == reads[end - 1].address + 4u) {
+           static_cast<uint64_t>(reads[end].address) == static_cast<uint64_t>(reads[end - 1].address) + 4u) {
       ++end;
     }
     return end;
@@ -973,7 +978,9 @@ std::string handleReadMemoryBatch(const JsonValue& params, Channel& channel) {
   size_t index = 0;
   while (index < reads.size()) {
     const size_t runEnd = safeScalar(index) ? contiguousRunEnd(index) : index + 1;
-    if (runEnd - index >= 2) {
+    // Keep large contiguous blocks on the efficient block-transfer path.
+    // Small adjacent scalars must not incur a first-word + block round trip.
+    if (runEnd - index >= 2 && runEnd - index > packedWordLimit) {
       std::vector<uint32_t> words;
       const Result readResult = target.readMemoryBlock(
           reads[index].address, static_cast<uint32_t>(runEnd - index), words, diagnostics, timeout);
@@ -997,31 +1004,45 @@ std::string handleReadMemoryBatch(const JsonValue& params, Channel& channel) {
       continue;
     }
 
-    if (safeScalar(index)) {
+    if (smallAlignedRange(index)) {
       size_t groupEnd = index + 1;
-      while (groupEnd < reads.size() && safeScalar(groupEnd)) {
-        if (contiguousRunEnd(groupEnd) - groupEnd >= 2) break;
+      while (groupEnd < reads.size() && smallAlignedRange(groupEnd)) {
+        if (safeScalar(groupEnd) && contiguousRunEnd(groupEnd) - groupEnd > packedWordLimit) break;
         ++groupEnd;
       }
-      if (groupEnd - index >= 2) {
-        std::vector<uint32_t> addresses;
-        addresses.reserve(groupEnd - index);
-        for (size_t item = index; item < groupEnd; ++item) addresses.push_back(reads[item].address);
-        std::vector<uint32_t> values;
-        uint32_t packedCompleted = 0;
-        const Result readResult = target.readMemoryScattered32(
-            addresses, values, packedCompleted, diagnostics, timeout);
-        for (size_t item = 0; item < values.size() && index + item < groupEnd; ++item) {
-          const uint32_t value = values[item];
-          results[index + item] = {
-              static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF),
-              static_cast<uint8_t>((value >> 16) & 0xFF), static_cast<uint8_t>((value >> 24) & 0xFF)};
-          ++completedReadCount;
+      std::vector<uint32_t> addresses;
+      std::vector<size_t> rangeWordEnds;
+      for (size_t item = index; item < groupEnd; ++item) {
+        for (uint32_t offset = 0; offset < reads[item].size; offset += 4u) {
+          addresses.push_back(reads[item].address + offset);
         }
-        if (!readResult.ok) return failBatch(index + packedCompleted, readResult);
-        index = groupEnd;
-        continue;
+        rangeWordEnds.push_back(addresses.size());
       }
+      std::vector<uint32_t> values;
+      uint32_t packedCompleted = 0;
+      const Result readResult = target.readMemoryScattered32(
+          addresses, values, packedCompleted, diagnostics, timeout);
+      size_t wordStart = 0;
+      size_t completedRanges = 0;
+      for (size_t item = index; item < groupEnd; ++item) {
+        const size_t wordEnd = rangeWordEnds[item - index];
+        if (wordEnd > values.size()) break;
+        auto& bytes = results[item];
+        bytes.reserve(reads[item].size);
+        for (size_t word = wordStart; word < wordEnd; ++word) {
+          const uint32_t value = values[word];
+          bytes.insert(bytes.end(), {
+              static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF),
+              static_cast<uint8_t>((value >> 16) & 0xFF), static_cast<uint8_t>((value >> 24) & 0xFF)});
+        }
+        wordStart = wordEnd;
+        ++completedRanges;
+        ++completedReadCount;
+      }
+      // Failure indices count original ranges, not flattened word reads.
+      if (!readResult.ok) return failBatch(index + completedRanges, readResult);
+      index = groupEnd;
+      continue;
     }
 
     std::vector<uint8_t> bytes;
@@ -1036,8 +1057,8 @@ std::string handleReadMemoryBatch(const JsonValue& params, Channel& channel) {
   applyTransportDelta(ioBefore, channel.transport->ioCounters(), diagnostics);
   diagnostics.transport = channel.transport->transportName();
   diagnostics.effectiveReadBytes = totalBytes;
-  diagnostics.fallbackReads = std::max(diagnostics.fallbackReads,
-                                       static_cast<uint32_t>(reads.size() - diagnostics.packedReads));
+  // packedReads counts 32-bit words; fallbackReads counts original ranges.
+  // A packed 8-byte range has two words but only one completed batch range.
 
   std::string readsJson = "[";
   for (size_t outputIndex = 0; outputIndex < reads.size(); ++outputIndex) {
@@ -3146,6 +3167,69 @@ int runSelfTest() {
     expect(mock.injection().blockReadCount == 1 &&
                mock.lastBlockRequest() == std::vector<uint8_t>({0x06, 0x00, 0x03, 0x00, 0x0F}),
            "dap03-vector-block-requests-chunk-minus-one");
+  }
+
+  {
+    // Exercise the original RPC range mapping with an independent wire oracle.
+    Channel channel;
+    auto scripted = std::make_unique<ScriptedTransport>();
+    auto* wire = scripted.get();
+    scripted->scripted = {0x05, 0x05, 0x01, 0xAA, 0xAA, 0xAA, 0xAA, 0x44, 0x33, 0x22, 0x11};
+    channel.transport = std::move(scripted);
+    channel.opened = channel.connected = true;
+    channel.packetSize = 64;
+    const JsonValue response = JsonParser(handleReadMemoryBatch(
+        JsonParser(R"({"reads":[{"address":4294967292,"size":4}]})").parse(), channel)).parse();
+    const auto* data = response.get("data");
+    const auto* returned = data ? data->get("reads") : nullptr;
+    expect(boolField(response, "ok").value_or(false) && returned && returned->array.size() == 1 &&
+               byteArrayField(returned->array[0], "bytes", 4).value_or(std::vector<uint8_t>{}) ==
+                   std::vector<uint8_t>({0x44, 0x33, 0x22, 0x11}),
+           "timeline-packed-uint32-upper-boundary-exact-bytes");
+    expect(wire->writeCalls == 1 && wire->lastRequest == std::vector<uint8_t>({
+               0x05, 0x00, 0x05, 0x08, 0, 0, 0, 0, 0x01, 0x12, 0, 0, 0xA2,
+               0x05, 0xFC, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E}),
+           "timeline-packed-uint32-upper-boundary-literal-tar");
+  }
+
+  for (const bool partialFirstRange : {true, false}) {
+    Channel channel;
+    auto scripted = std::make_unique<ScriptedTransport>();
+    // Completed words count differs from completed original ranges. WAIT
+    // after one word of an 8-byte range must never mark that range complete.
+    const std::vector<uint8_t> oneWord = {
+        0x05, 0x05, 0x02, 0xAA, 0xAA, 0xAA, 0xAA, 0x44, 0x33, 0x22, 0x11};
+    const std::vector<uint8_t> twoWords = {
+        0x05, 0x08, 0x02, 0xAA, 0xAA, 0xAA, 0xAA, 0x44, 0x33, 0x22, 0x11,
+        0xBB, 0xBB, 0xBB, 0xBB, 0x88, 0x77, 0x66, 0x55};
+    for (uint32_t attempt = 0; attempt <= kMaxTransferRetries; ++attempt) {
+      scripted->scriptedResponses.push_back(partialFirstRange ? oneWord : twoWords);
+    }
+    channel.transport = std::move(scripted);
+    channel.opened = channel.connected = true;
+    channel.packetSize = 64;
+    const char* request = partialFirstRange
+        ? R"({"reads":[{"address":536870912,"size":8},{"address":536870944,"size":4}]})"
+        : R"({"reads":[{"address":536870912,"size":4},{"address":536870944,"size":8}]})";
+    const JsonValue response = JsonParser(handleReadMemoryBatch(JsonParser(request).parse(), channel)).parse();
+    const auto* diag = response.get("diagnostics");
+    expect(!boolField(response, "ok").value_or(true) && diag &&
+               stringField(response, "errorCode").value_or("") == ErrorCodes::kDapAckWait &&
+               uintField(*diag, "failedIndex").value_or(99) == (partialFirstRange ? 0u : 1u) &&
+               uintField(*diag, "completedReads").value_or(99) == (partialFirstRange ? 0u : 1u) &&
+               uintField(*diag, "effectiveReadBytes").value_or(99) == (partialFirstRange ? 0u : 4u) &&
+               uintField(*diag, "waitRetries").value_or(99) == kMaxTransferRetries,
+           partialFirstRange ? "timeline-partial-merged-range-not-complete"
+                             : "timeline-partial-merged-range-maps-original-failed-index");
+  }
+
+  {
+    ScriptedTransport scripted;
+    CmsisDapProtocol protocol(&scripted);
+    CmsisDapTarget small(&protocol, 32);
+    CmsisDapTarget large(&protocol, 512);
+    expect(small.maxScatteredReadsPerPacket() == 2 && large.maxScatteredReadsPerPacket() == 7,
+           "timeline-packed-capacity-respects-negotiated-and-transport-limits");
   }
 
   {

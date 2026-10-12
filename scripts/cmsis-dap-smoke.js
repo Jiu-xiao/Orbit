@@ -146,7 +146,7 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('rtt'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
-  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 25,
+  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 26,
     JSON.stringify(enumAll));
 
   const enumFiltered = await request('enumDevices', { transport: 'mock', vid: '1234', pid: '9999' });
@@ -556,6 +556,47 @@ async function runDap03Matrix() {
       && memoryBatch.diagnostics.fallbackReads === 0
       && memoryBatch.diagnostics.completedReads === 2,
     JSON.stringify(memoryBatch));
+    for (const [label, reads] of [
+      ['adjacent scalars', [{ address: 0x20000000, size: 4 }, { address: 0x20000004, size: 4 }]],
+      ['merged 8-byte range', [{ address: 0x20000000, size: 8 }]],
+      ['merged 12-byte range', [{ address: 0x20000000, size: 12 }]],
+      ['merged 16-byte range', [{ address: 0x20000000, size: 16 }]],
+      ['explicit TAR across 1KB boundary', [{ address: 0x200003FC, size: 8 }]],
+      ['reordered mixed small ranges', [{ address: 0x20000040, size: 8 }, { address: 0x20000000, size: 12 }, { address: 0x20000020, size: 4 }]],
+    ]) {
+      const batch = await request('readMemoryBatch', { reads });
+      check(`timeline: ${label} uses one protocol exchange and preserves bytes/order`, batch.ok
+        && batch.data.reads.length === reads.length
+        && batch.data.reads.every((item, i) => item.address === reads[i].address
+          && item.size === reads[i].size && bytesMatchPattern(item.bytes, item.address))
+        && batch.diagnostics.packets === 1
+        && batch.diagnostics.dapTransferCount === 1
+        && batch.diagnostics.dapTransferBlockCount === 0
+        && batch.diagnostics.fallbackReads === 0
+        && batch.diagnostics.completedReads === reads.length,
+      JSON.stringify(batch));
+    }
+    const splitSmallBatch = await request('readMemoryBatch', {
+      reads: Array.from({ length: 4 }, (_, i) => ({ address: 0x20000100 + i * 32, size: 8 })),
+    });
+    check('timeline: small ranges split at negotiated packet capacity without losing data', splitSmallBatch.ok
+      && splitSmallBatch.diagnostics.packets === 2 && splitSmallBatch.diagnostics.packedReads === 8
+      && splitSmallBatch.diagnostics.fallbackReads === 0
+      && splitSmallBatch.data.reads.every(item => bytesMatchPattern(item.bytes, item.address)),
+    JSON.stringify(splitSmallBatch));
+    const longContinuousBatch = await request('readMemoryBatch', {
+      reads: [
+        ...Array.from({ length: 8 }, (_, i) => ({ address: 0x200003FC + i * 4, size: 4 })),
+        { address: 0x20000500, size: 4 }, { address: 0x20000520, size: 4 },
+      ],
+    });
+    check('timeline: long contiguous scalar run keeps block reads across TAR boundary, then resumes packing', longContinuousBatch.ok
+      && longContinuousBatch.diagnostics.dapTransferBlockCount > 0
+      && longContinuousBatch.diagnostics.fallbackReads === 8
+      && longContinuousBatch.diagnostics.packedReads === 2
+      && longContinuousBatch.diagnostics.completedReads === 10
+      && longContinuousBatch.data.reads.every(item => bytesMatchPattern(item.bytes, item.address)),
+    JSON.stringify(longContinuousBatch));
     const mixedBatch = await request('readMemoryBatch', {
       reads: [
         { address: 0x20000000, size: 4 },
@@ -563,14 +604,16 @@ async function runDap03Matrix() {
         { address: 0x20000013, size: 1 },
         { address: 0x20000020, size: 4 },
         { address: 0x20000040, size: 4 },
+        { address: 0x20000100, size: 64 },
       ],
     });
     check('dap07: continuous/block/scattered/fallback strategy is mixed safely', mixedBatch.ok
-      && mixedBatch.data.reads.length === 5
+      && mixedBatch.data.reads.length === 6
+      && mixedBatch.data.reads.every(item => bytesMatchPattern(item.bytes, item.address))
       && mixedBatch.diagnostics.dapTransferBlockCount > 0
-      && mixedBatch.diagnostics.packedReads === 2
-      && mixedBatch.diagnostics.fallbackReads === 3
-      && mixedBatch.diagnostics.effectiveReadBytes === 17,
+      && mixedBatch.diagnostics.packedReads === 4
+      && mixedBatch.diagnostics.fallbackReads === 2
+      && mixedBatch.diagnostics.effectiveReadBytes === 81,
     JSON.stringify(mixedBatch));
     const emptyBatch = await request('readMemoryBatch', { reads: [] });
     check('dap07: readMemoryBatch rejects an empty request', !emptyBatch.ok
@@ -1330,6 +1373,75 @@ async function runDap11H723Matrix() {
   await closeDevice('dap11-h723');
 }
 
+// The actual source-built image crosses the native ABI/layout boundary here.
+// Mock Flash effects are an independent oracle, not execution of the FPEC code.
+async function runF103C8Matrix() {
+  await openAndInfo('1234', '5691', 'f103c8');
+  const connected = await request('connect', { port: 'SWD' });
+  check('f103c8: connect', connected.ok, JSON.stringify(connected));
+  if (connected.ok) {
+    const halted = await request('halt', { timeoutMs: 100 });
+    check('f103c8: halt', halted.ok, JSON.stringify(halted));
+    const dp = await request('dpRead', { reg: 0 });
+    check('f103c8: DPIDR 0x1BA01477', dp.ok && dp.data.value === 0x1BA01477, JSON.stringify(dp));
+    const id = await request('readMemory', { address: 0xE0042000, size: 4 });
+    check('f103c8: DEV_ID 0x410', id.ok && id.data.bytes.join(',') === '16,4,0,32', JSON.stringify(id));
+    const capacity = await request('readMemory', { address: 0x1FFFF7E0, size: 2 });
+    check('f103c8: 64 KiB capacity register', capacity.ok && capacity.data.bytes.join(',') === '64,0', JSON.stringify(capacity));
+    const image = Array.from(require('fs').readFileSync(path.join(path.dirname(helperPath), 'orbit-stm32f103c8-flash-algorithm.bin')));
+    const params = (operation, address, size, data = [], reusePageBuffer = false) => ({
+      ...flashAlgorithmParams(operation, address, size, data, reusePageBuffer),
+      algorithm: image,
+      pageBufferAddress: 0x20000000 + Math.ceil(image.length / 4) * 4,
+      stackPointer: 0x20005000,
+      ramBase: 0x20000000,
+      ramSize: 20 * 1024,
+      flashStatusAddress: 0x4002200C,
+      flashControlAddress: 0x40022010,
+    });
+    const init = await request('flashAlgorithm', params('init', 0x08000000, 0));
+    check('f103c8: built image Init in 20 KiB SRAM', init.ok && init.data.returnCode === 0
+      && init.data.pc === 0x20000500 && (init.data.dhcsr & 0x20000) !== 0, JSON.stringify(init));
+    const page = Array.from({ length: 1024 }, (_, index) => index & 0xFF);
+    for (const [address, data] of [[0x08000000, page], [0x0800FFFE, [0xFF, 0x42]]]) {
+      const erase = await request('flashAlgorithm', params('eraseSector', address & ~0x3FF, 1024));
+      check(`f103c8: erase page at ${address.toString(16)}`, erase.ok && erase.data.returnCode === 0, JSON.stringify(erase));
+      const program = await request('flashAlgorithm', params('programPage', address, data.length, data));
+      check(`f103c8: halfword program at ${address.toString(16)}`, program.ok && program.data.returnCode === 0, JSON.stringify(program));
+      const verify = await request('flashAlgorithm', params('verify', address, data.length, data, true));
+      check(`f103c8: Verify with reused page buffer at ${address.toString(16)}`, verify.ok
+        && verify.data.returnCode === 0 && verify.diagnostics.blockWrites === 0, JSON.stringify(verify));
+      const readback = await request('readMemory', { address, size: data.length });
+      check(`f103c8: complete readback at ${address.toString(16)}`, readback.ok
+        && readback.data.bytes.join(',') === data.join(','), JSON.stringify(readback));
+    }
+    for (const [operation, address, size, data] of [
+      ['eraseSector', 0x08000002, 1024, []],
+      ['eraseSector', 0x0800FC00, 2048, []],
+      ['programPage', 0x08010000, 2, [1, 2]],
+      ['programPage', 0x08000001, 2, [1, 2]],
+      ['programPage', 0x08000000, 1, [1]],
+      ['programPage', 0x08000002, 2, [0, 2]],
+    ]) {
+      const invalid = await request('flashAlgorithm', params(operation, address, size, data));
+      check(`f103c8: rejects ${operation} address=${address.toString(16)} size=${size}`,
+        !invalid.ok && invalid.errorCode === 'DapAlgorithmError', JSON.stringify(invalid));
+    }
+    const zero = await request('flashAlgorithm', params('programPage', 0x08000002, 2, [0, 0]));
+    check('f103c8: non-erased halfword accepts the documented all-zero exception', zero.ok
+      && zero.data.returnCode === 0, JSON.stringify(zero));
+    const invalidStack = params('init', 0x08000000, 0);
+    invalidStack.stackPointer = 0x20005008;
+    const layout = await request('flashAlgorithm', invalidStack);
+    check('f103c8: native rejects stack beyond 20 KiB SRAM', !layout.ok
+      && layout.errorCode === 'DapInvalidRequest', JSON.stringify(layout));
+    const uninit = await request('flashAlgorithm', params('uninit', 0x08000000, 0));
+    check('f103c8: UnInit', uninit.ok && uninit.data.returnCode === 0, JSON.stringify(uninit));
+  }
+  await request('disconnect', {});
+  await closeDevice('f103c8');
+}
+
 async function main() {
   try {
     if (useMock) {
@@ -1337,6 +1449,7 @@ async function main() {
     await runDap03Matrix();
     await runDap02AMatrix();
     await runDap11H723Matrix();
+    await runF103C8Matrix();
       await runDap04Matrix();
       await runDap05Matrix();
       await runDap05CleanupMatrix();

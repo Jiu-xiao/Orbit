@@ -23,6 +23,10 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     config: vscode.DebugConfiguration,
     token?: vscode.CancellationToken
   ): Promise<vscode.DebugConfiguration> {
+    // 初始模板留空芯片，避免未填写时连接到默认型号。
+    if (typeof config.device === 'string' && !config.device.trim()) {
+      throw new Error('请先在 launch.json 的 device 中填写芯片型号，例如 STM32F407VET6。');
+    }
     const cfg = getOrbitConfiguration();
 
     if (!config.request) {
@@ -54,7 +58,7 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (!config.program) {
       let program = cfg.get<string>('defaultProgram', '');
       if (!program) {
-        program = this.findElf();
+        program = this.findElf(folder);
         cfg.update('defaultProgram', program, vscode.ConfigurationTarget.Workspace);
       }
       config.program = program;
@@ -69,17 +73,25 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
       config.svdPath = explicitSvd;
     } else if (!token?.isCancellationRequested) {
       const workspaceRoot = folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const startedAt = Date.now();
+      log.dap(`[svd] preparing device=${config.device}`);
+      // Launch waits only for local files/cache. Network retrieval starts after
+      // the visible debug session has started, and never delays target startup.
       const resolution = await resolveSvdForDevice(String(config.device), {
         workspaceRoot,
         cacheRoot: this.svdCacheRoot,
-        allowDownload: cfg.get<boolean>('svdAutoDownload', true),
+        allowDownload: false,
       });
+      log.dap(`[svd] prepared device=${config.device} source=${resolution.source} elapsedMs=${Date.now() - startedAt}`);
       if (resolution.path && !token?.isCancellationRequested) {
         config.svdFile = resolution.path;
         config.svdPath = resolution.path;
         log.dap(`[svd] ${config.device} -> ${resolution.path} (${resolution.source})`);
       } else if (resolution.warning) {
-        log.dap(`[svd] ${resolution.warning}; 调试继续，但外设寄存器视图不可用`);
+        const action = cfg.get<boolean>('svdAutoDownload', true)
+          ? '先启动调试，SVD 在会话启动后后台获取'
+          : 'orbit.svdAutoDownload 已关闭，调试继续';
+        log.dap(`[svd] 本地未找到 ${config.device} 的 SVD；${action}`);
       }
     }
     if (config.rtos === undefined) {
@@ -128,11 +140,9 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     return config;
   }
 
-  private findElf(): string {
-    const wsFolders = vscode.workspace.workspaceFolders;
-    if (!wsFolders) return '${workspaceFolder}/build/Debug/frame.elf';
-
-    const workspaceRoot = wsFolders[0].uri.fsPath;
+  private findElf(folder?: vscode.WorkspaceFolder): string {
+    const workspaceRoot = folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) return '${workspaceFolder}/build/Debug/frame.elf';
     const buildDirs = ['build/Debug', 'build/Release', 'build'];
     for (const dir of buildDirs) {
       const fullDir = path.join(workspaceRoot, dir);

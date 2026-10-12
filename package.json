@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit STM32 Debugger",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.1.5",
+  "version": "1.1.7",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -136,13 +136,55 @@
         "label": "Orbit (J-Link / CMSIS-DAP)",
         "runtime": "node",
         "program": "./dist/debugadapter.js",
+        "languages": ["c", "cpp", "asm"],
+        "initialConfigurations": [
+          {
+            "name": "Orbit Debug",
+            "type": "orbit",
+            "request": "launch",
+            "device": ""
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Orbit: 最小调试配置",
+            "description": "只需填写芯片型号，ELF/AXF 文件和探针自动查找。",
+            "body": {
+              "name": "Orbit Debug",
+              "type": "orbit",
+              "request": "launch",
+              "device": "${1:STM32F407VET6}"
+            }
+          }
+        ],
         "configurationAttributes": {
           "launch": {
             "properties": {
               "device": {
                 "type": "string",
-                "description": "Target device name",
-                "default": "STM32F407VG"
+                "minLength": 1,
+                "description": "填写目标芯片型号，例如 STM32F407VET6。ELF/AXF 文件和探针自动查找。",
+                "default": "STM32F407VG",
+                "defaultSnippets": [
+                  { "label": "STM32F103C8T6", "body": "STM32F103C8T6" },
+                  { "label": "STM32F103RBT6", "body": "STM32F103RBT6" },
+                  { "label": "STM32F103RCT6", "body": "STM32F103RCT6" },
+                  { "label": "STM32F103ZET6", "body": "STM32F103ZET6" },
+                  { "label": "STM32F401CCU6", "body": "STM32F401CCU6" },
+                  { "label": "STM32F405RGT6", "body": "STM32F405RGT6" },
+                  { "label": "STM32F407VET6", "body": "STM32F407VET6" },
+                  { "label": "STM32F407VGT6", "body": "STM32F407VGT6" },
+                  { "label": "STM32F407IGT6", "body": "STM32F407IGT6" },
+                  { "label": "STM32F407IGH6", "body": "STM32F407IGH6" },
+                  { "label": "STM32F411CEU6", "body": "STM32F411CEU6" },
+                  { "label": "STM32F429IGT6", "body": "STM32F429IGT6" },
+                  { "label": "STM32F446RET6", "body": "STM32F446RET6" },
+                  { "label": "STM32G431CBT6", "body": "STM32G431CBT6" },
+                  { "label": "STM32G474RET6", "body": "STM32G474RET6" },
+                  { "label": "STM32H723VGT6", "body": "STM32H723VGT6" },
+                  { "label": "STM32H743VIT6", "body": "STM32H743VIT6" },
+                  { "label": "STM32H750VBT6", "body": "STM32H750VBT6" }
+                ]
               },
               "deviceName": {
                 "type": "string",
@@ -388,7 +430,7 @@
         "orbit.svdAutoDownload": {
           "type": "boolean",
           "default": true,
-          "description": "本地没有匹配 SVD 时，按芯片系列下载并缓存一个 Keil Device Family Pack，仅提取当前芯片对应的 SVD；失败不会阻止调试"
+            "description": "本地没有匹配 SVD 时直接启动调试，后台下载并缓存对应系列的 Keil Device Family Pack，失败自动重试；下载成功后下次启动自动使用"
         },
         "orbit.defaultRtos": {
           "type": "string",

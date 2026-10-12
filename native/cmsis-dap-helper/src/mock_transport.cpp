@@ -72,6 +72,7 @@ MockCmsisDapTransport::MockCmsisDapTransport() {
   devices_.push_back(makeDevice("1234", "568E", "MOCK-0023", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "568F", "MOCK-0024", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "5690", "MOCK-0025", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "5691", "MOCK-0026", 65, 65, 0));
 }
 
 DeviceDescriptor MockCmsisDapTransport::makeDevice(const std::string& vid, const std::string& pid,
@@ -153,6 +154,20 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
         state_.profile = h723;
         state_.dpIdcode = h723.dpIdcode;
       }
+      if (key == "1234:5691") {
+        // Independent STM32F103C8T6 oracle: 64 KiB Flash, 20 KiB SRAM.
+        MockTargetProfile f103;
+        f103.dpIdcode = 0x1BA01477u;
+        f103.idcodeValue = 0x20000410u;
+        f103.flashSizeWordAddress = 0x1FFFF7E0u;
+        f103.flashSizeWordValue = 64u;
+        f103.ramSize = 20u * 1024u;
+        f103.flashSize = 64u * 1024u;
+        f103.flashSectorSize = 1024u;
+        f103.programAlignment = 2u;
+        state_.profile = f103;
+        state_.dpIdcode = f103.dpIdcode;
+      }
       state_.ram.assign(state_.profile.ramSize, 0);
       state_.flash.assign(state_.profile.flashSize, 0);
       for (uint32_t i = 0; i < state_.profile.ramSize; ++i) {
@@ -165,6 +180,10 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
           kMockFlashVectorWord0, kMockFlashVectorWord1,
           kMockFlashVectorWord2, kMockFlashVectorWord3};
       std::memcpy(state_.flash.data(), vectorWords, sizeof(vectorWords));
+      if (key == "1234:5691") {
+        const uint32_t initialSp = 0x20005000u;
+        std::memcpy(state_.flash.data(), &initialSp, sizeof(initialSp));
+      }
       // DAP-05 source-step fixture: NOP; BL 0x080001E0; return at 0x080001C6.
       const uint8_t sourceStepFixture[] = {
           0x00, 0xBF,                    // 0x080001C0 NOP
@@ -846,7 +865,8 @@ void MockCmsisDapTransport::runPreparedFlashAlgorithm() {
   } else if (operation == "programPage") {
     injection_.flashProgramCount++;
     if (address < profile.flashBase || address + size > profile.flashBase + profile.flashSize
-        || data.size() < size) {
+        || size == 0 || data.size() < size
+        || address % profile.programAlignment != 0 || size % profile.programAlignment != 0) {
       returnCode = 3;
     } else {
       for (uint32_t index = 0; index < size; ++index) {
@@ -855,6 +875,21 @@ void MockCmsisDapTransport::runPreparedFlashAlgorithm() {
         if ((oldValue & newValue) != newValue) {
           returnCode = 4;  // programming can only change 1 -> 0
           break;
+        }
+      }
+      if (returnCode == 0 && profile.programAlignment == 2u) {
+        // Independent F103 FPEC oracle (PM0075 2.3.3): a non-erased
+        // halfword may only be skipped unchanged or programmed to 0x0000.
+        for (uint32_t index = 0; index < size; index += 2) {
+          const uint32_t offset = address - profile.flashBase + index;
+          const uint16_t current = static_cast<uint16_t>(state_.flash[offset]) |
+                                   static_cast<uint16_t>(state_.flash[offset + 1]) << 8;
+          const uint16_t value = static_cast<uint16_t>(data[index]) |
+                                 static_cast<uint16_t>(data[index + 1]) << 8;
+          if (current != 0xFFFFu && value != 0 && value != current) {
+            returnCode = 3;
+            break;
+          }
         }
       }
       if (returnCode == 0 && profile.flashWordSize != 0) {

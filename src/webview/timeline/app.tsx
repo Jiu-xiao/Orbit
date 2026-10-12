@@ -1,6 +1,8 @@
 import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import {
   appendTimelineSamples,
+  retainTimelineSamples,
+  startsTimelineSegment,
   TimelineFrameBatcher,
   type TimelineDataPoint,
   type TimelineSampleSnapshot,
@@ -19,6 +21,11 @@ import {
   type TimelineEntryUpdate,
 } from './timeline-entry-state';
 
+import type { TimelineTab } from '../../timeline/timeline-model';
+import { calculateBufferedRange } from './timeline-range';
+import { clampTimelineTimePerDiv, MAX_TIMELINE_TIME_PER_DIV_MS, parseTimelineTimePerDiv, TIMELINE_TIME_PRESETS_MS } from './timeline-time-scale';
+import { TIMELINE_SAMPLE_RATE_STALE_MS } from './timeline-sample-rate';
+
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
 
@@ -31,7 +38,10 @@ catch { vscode = { postMessage: () => {} }; }
 const H_DIV = 8;
 const V_DIV = 6;
 const SUB_DIV = 5;
-const TIME_PRESETS = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 30000, 60000, 75000];
+const VARIABLE_LIST_WIDTH = 181;
+const PLOT_LEFT_MARGIN = 12;
+const PLOT_TOP_MARGIN = 8;
+const EXPORT_ROW_PADDING = 3;
 
 function autoCalcPerDiv(pts: DataPoint[], firstTimestamp = Number.NEGATIVE_INFINITY): { yPerDiv: number; yCenter: number } {
   if (pts.length === 0) return { yPerDiv: 1, yCenter: 0 };
@@ -49,19 +59,62 @@ function autoCalcPerDiv(pts: DataPoint[], firstTimestamp = Number.NEGATIVE_INFIN
 }
 
 export function TimelineApp() {
-  const [entries, setEntries] = useState<Entry[]>([]);
+  const [tabs, setTabs] = useState<TimelineTab[]>([]);
+  const [active, setActive] = useState<any>(null);
+  const [activation, setActivation] = useState(0);
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      const msg = event.data;
+      if (msg.command === 'tabs') setTabs(msg.tabs || []);
+      if (msg.command === 'activate') { setActive(msg); setActivation(n => n + 1); }
+    };
+    window.addEventListener('message', handler);
+    vscode.postMessage({ command: 'init' });
+    return () => window.removeEventListener('message', handler);
+  }, []);
+  const activeInfo = tabs.find(t => t.id === active?.tab?.id) ?? active?.tab;
+  return <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div role="tablist" aria-label="Timeline 记录" style={{ display: 'flex', flexShrink: 0, overflowX: 'auto', gap: 3, padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
+      {tabs.map(tab => <div key={tab.id} style={{ display: 'flex', alignItems: 'center', background: tab.id === active?.tab?.id ? 'var(--vscode-tab-activeBackground, #444)' : 'transparent', borderRadius: 3 }}>
+        <button role="tab" aria-selected={tab.id === active?.tab?.id} style={{ ...iconBtnStyle, border: 'none', whiteSpace: 'nowrap' }} onClick={() => vscode.postMessage({ command: 'selectTab', tabId: tab.id })} title={tab.error ?? tab.name}>
+          {tab.kind === 'live' ? '● ' : ''}{tab.name}{tab.incomplete ? ' ⚠' : ''}
+        </button>
+        {tab.kind === 'history' && <button aria-label={'关闭 ' + tab.name} style={{ ...iconBtnStyle, border: 'none' }} onClick={() => vscode.postMessage({ command: 'closeTab', tabId: tab.id })}>×</button>}
+      </div>)}
+      <button style={iconBtnStyle} title="打开 CSV 为新标签" onClick={() => vscode.postMessage({ command: 'openCsv' })}>＋ 打开 CSV</button>
+      <button style={iconBtnStyle} onClick={() => vscode.postMessage({ command: 'recoverRecord' })}>恢复记录</button>
+    </div>
+    {active && <TimelinePlot key={active.tab.id + ':' + activation} boot={active} kind={activeInfo.kind} />}
+  </div>;
+}
+
+function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) {
+  const sendMessage = (message: any) => vscode.postMessage({ ...message, tabId: boot.tab.id, recordId: boot.tab.recordId });
+  const [cursorA, setCursorA] = useState<number | null>(boot.cursorA_ms ?? null);
+  const [cursorB, setCursorB] = useState<number | null>(boot.cursorB_ms ?? null);
+  const cursorRef = useRef({ A: cursorA, B: cursorB });
+  cursorRef.current = { A: cursorA, B: cursorB };
+  const cursorDragRef = useRef<'A' | 'B' | null>(null);
+  const [rangeError, setRangeError] = useState(boot.tab.error ?? '');
+  const [sampleRateHz, setSampleRateHz] = useState<number>(boot.sampleRateHz ?? 0);
+  const [averageSampleRateHz, setAverageSampleRateHz] = useState<number | null>(boot.averageSampleRateHz ?? null);
+  const sampleRateReceivedAt = useRef(performance.now());
+  const debugEditable = kind === 'live' || kind === 'template';
+  const [entries, setEntries] = useState<Entry[]>((boot.entries || []).map(createTimelineEntry));
   const allDataRef = useRef<Map<string, DataPoint[]>>(new Map());
-  const [timePerDiv, setTimePerDiv] = useState(100);
+  const [timePerDiv, setTimePerDiv] = useState<number>(clampTimelineTimePerDiv(boot.timePerDiv ?? 100));
   const timePerDivRef = useRef(timePerDiv);
   timePerDivRef.current = timePerDiv;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [renderTick, setRenderTick] = useState(0);
   const [newExpr, setNewExpr] = useState('');
-  const [autoFollow, setAutoFollow] = useState(true);
-  const autoFollowRef = useRef(true);
+  const [autoFollow, setAutoFollow] = useState(boot.autoFollow ?? true);
+  const autoFollowRef = useRef(boot.autoFollow ?? true);
   const tEndRef = useRef(Date.now());
   const latestSampleTimestampRef = useRef(0);
   const isDraggingRef = useRef(false);
+  const pointerDownRef = useRef(false);
+  const capturedPointerRef = useRef<number | null>(null);
   const dragStartXRef = useRef(0);
   const dragStartTEndRef = useRef(0);
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
@@ -79,13 +132,23 @@ export function TimelineApp() {
 
   if (!rangeControllerRef.current) rangeControllerRef.current = new TimelineRangeController();
 
+  const retainViewportSamples = () => {
+    const end = tEndRef.current;
+    const buffer = calculateBufferedRange(end - timePerDivRef.current * H_DIV, end, historyBoundsRef.current);
+    retainTimelineSamples(allDataRef.current, buffer);
+    if (buffer) rangeControllerRef.current!.retainCoverage(buffer);
+    else rangeControllerRef.current!.clearCoverage();
+  };
+
   applySamplesRef.current = (snapshots) => {
     const map = allDataRef.current;
     const latestTimestamp = appendTimelineSamples(map, snapshots);
     if (latestTimestamp !== undefined) {
       latestSampleTimestampRef.current = Math.max(latestSampleTimestampRef.current, latestTimestamp);
-      if (autoFollowRef.current) tEndRef.current = latestSampleTimestampRef.current;
+      if (autoFollowRef.current) tEndRef.current = historyBoundsRef.current?.end ?? latestSampleTimestampRef.current;
     }
+    // Range acceptance, point merging and coverage eviction share one frame.
+    retainViewportSamples();
     if (autoFollowRef.current) {
       setEntries(prev => {
         let changed = false;
@@ -102,6 +165,7 @@ export function TimelineApp() {
       });
     }
     setRenderTick(t => t + 1);
+    scheduleVisibleRangeRequest();
     if (lastHoverClientX.current > 0) {
       computeHoverRef.current(lastHoverClientX.current, lastHoverClientY.current);
     }
@@ -129,12 +193,14 @@ export function TimelineApp() {
       for (const expression of allDataRef.current.keys()) allDataRef.current.set(expression, []);
       setRenderTick(tick => tick + 1);
     }
+    // Pan/zoom can evict data even before a new range reply arrives.
+    retainViewportSamples();
     for (const request of controller.requestViewport(tStart, tEnd)) {
       const targetBuckets = Math.min(
         100_000,
         Math.max(1, Math.ceil((request.end - request.start) / resolutionKey)),
       );
-      vscode.postMessage({
+      sendMessage({
         command: 'loadRange',
         ...request,
         generation: controller.generation,
@@ -159,11 +225,14 @@ export function TimelineApp() {
   };
 
   const saveState = useCallback(() => {
-    vscode.postMessage({
+    sendMessage({
       command: 'saveState',
       state: {
         autoFollow: autoFollowRef.current,
         timePerDiv,
+        viewportEndMs: tEndRef.current,
+        cursorA_ms: cursorRef.current.A,
+        cursorB_ms: cursorRef.current.B,
         entries: entries.map(e => ({
           expression: e.expression,
           enabled: e.enabled,
@@ -179,6 +248,7 @@ export function TimelineApp() {
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       const msg = event.data;
+      if (msg.tabId !== boot.tab.id || msg.recordId !== boot.tab.recordId) return;
       switch (msg.command) {
         case 'init': {
           const eList: Entry[] = (msg.entries || []).map((e: TimelineEntryUpdate) => createTimelineEntry(e));
@@ -189,15 +259,16 @@ export function TimelineApp() {
             autoFollowRef.current = msg.autoFollow;
           }
           if (msg.timePerDiv !== undefined) {
-            setTimePerDiv(msg.timePerDiv);
-            timePerDivRef.current = msg.timePerDiv;
+            const restoredTimePerDiv = clampTimelineTimePerDiv(msg.timePerDiv);
+            setTimePerDiv(restoredTimePerDiv);
+            timePerDivRef.current = restoredTimePerDiv;
           }
           const m = new Map<string, DataPoint[]>();
           for (const e of eList) m.set(e.expression, []);
           allDataRef.current = m;
           rangeControllerRef.current!.clearCoverage();
           updateHistoryBounds(msg.historyBounds ?? null);
-          if (msg.historyBounds) tEndRef.current = msg.historyBounds.end;
+          if (msg.historyBounds) tEndRef.current = msg.viewportEndMs ?? msg.historyBounds.end;
           setRenderTick(t => t + 1);
           initedRef.current = true;
           requestVisibleRange();
@@ -206,39 +277,44 @@ export function TimelineApp() {
         case 'entries': {
           const updates: TimelineEntryUpdate[] = msg.entries || [];
           setEntries(prev => mergeTimelineEntryRefresh(prev, updates));
+          rangeControllerRef.current!.clearCoverage();
+          scheduleVisibleRangeRequest();
           setRenderTick(t => t + 1);
           break;
         }
+        case 'sampleRate': {
+          if (Number.isFinite(msg.averageSampleRateHz) && msg.averageSampleRateHz >= 0) setAverageSampleRateHz(msg.averageSampleRateHz);
+          break;
+        }
         case 'samples': {
+          if (Number.isFinite(msg.sampleRateHz) && msg.sampleRateHz >= 0) {
+            setSampleRateHz(msg.sampleRateHz);
+            sampleRateReceivedAt.current = performance.now();
+          }
           const snapshots: SampleSnapshot[] = msg.snapshots || [];
           if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
-          let start = Number.POSITIVE_INFINITY;
-          let end = Number.NEGATIVE_INFINITY;
-          for (const snapshot of snapshots) {
-            if (snapshot.data.length === 0) continue;
-            start = Math.min(start, snapshot.data[0].timestamp);
-            end = Math.max(end, snapshot.data[snapshot.data.length - 1].timestamp);
-          }
-          if (Number.isFinite(start) && Number.isFinite(end)) {
-            rangeControllerRef.current!.markLoadedRange({ start, end });
-          }
-          sampleBatcherRef.current?.enqueue(snapshots);
+          rangeControllerRef.current!.markLiveSamples(snapshots);
+          if (autoFollowRef.current && historyBoundsRef.current) tEndRef.current = historyBoundsRef.current.end;
+          scheduleVisibleRangeRequest();
           break;
         }
         case 'rangeSamples': {
-          if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
-          if (!rangeControllerRef.current!.completeRequest(
-            msg.requestId,
-            msg.range ?? null,
-            msg.generation,
-            msg.resolutionKey,
-          )) break;
-          sampleBatcherRef.current?.enqueue(msg.snapshots || []);
-          requestVisibleRange();
+          sampleBatcherRef.current?.enqueue(msg.snapshots || [], () => {
+            if (!rangeControllerRef.current!.completeRequest(
+              msg.requestId,
+              msg.error ? null : msg.range ?? null,
+              msg.generation,
+              msg.resolutionKey,
+            )) return false;
+            setRangeError(msg.error ?? '');
+            if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
+            return !msg.error;
+          });
           break;
         }
         case 'historyBounds': {
           rangeControllerRef.current!.cancelPendingRequests();
+          rangeControllerRef.current!.resetLiveContinuity();
           updateHistoryBounds(msg.bounds ?? null);
           if (msg.bounds && autoFollowRef.current) tEndRef.current = msg.bounds.end;
           setRenderTick(t => t + 1);
@@ -248,9 +324,17 @@ export function TimelineApp() {
       }
     };
     window.addEventListener('message', handler);
-    vscode.postMessage({ command: 'init' });
+    handler({ data: { ...boot, command: 'init', tabId: boot.tab.id, recordId: boot.tab.recordId } } as MessageEvent);
     return () => window.removeEventListener('message', handler);
   }, []);
+
+  useEffect(() => {
+    if (kind !== 'live') return;
+    const timer = window.setInterval(() => {
+      if (performance.now() - sampleRateReceivedAt.current >= TIMELINE_SAMPLE_RATE_STALE_MS) setSampleRateHz(0);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [kind]);
 
   useEffect(() => () => {
     sampleBatcherRef.current?.dispose();
@@ -276,7 +360,7 @@ export function TimelineApp() {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const margin = { top: 8, right: 12, bottom: 28, left: 12 };
+    const margin = { top: PLOT_TOP_MARGIN, right: 12, bottom: 28, left: PLOT_LEFT_MARGIN };
     const plotW = W - margin.left - margin.right;
     const plotH = H - margin.top - margin.bottom;
     if (plotW < 20 || plotH < 20) return;
@@ -397,6 +481,35 @@ export function TimelineApp() {
 
     ctx.restore();
 
+    for (const [label, time] of Object.entries(cursorRef.current)) {
+      if (time === null) continue;
+      const x = margin.left + (time - tStart) / (tEnd - tStart) * plotW;
+      if (x < margin.left || x > margin.left + plotW) continue;
+      ctx.save(); ctx.strokeStyle = label === 'A' ? '#FFD166' : '#79C0FF'; ctx.fillStyle = ctx.strokeStyle;
+      ctx.lineWidth = 1.5; ctx.setLineDash([6, 3]); ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
+      ctx.font = 'bold 12px sans-serif'; ctx.fillText(label, x + 4, margin.top + 12); ctx.restore();
+    }
+    const { A, B } = cursorRef.current;
+    if (A !== null && B !== null) {
+      const left = margin.left + (Math.min(A, B) - tStart) / (tEnd - tStart) * plotW;
+      const right = margin.left + (Math.max(A, B) - tStart) / (tEnd - tStart) * plotW;
+      if (right >= margin.left && left <= margin.left + plotW) {
+        const x1 = Math.max(margin.left, left), x2 = Math.min(margin.left + plotW, right);
+        const distance = Math.abs(B - A);
+        const label = 'Δt = ' + (distance >= 1000 ? (distance / 1000).toFixed(3) + ' s' : distance.toFixed(3) + ' ms');
+        const y = margin.top + 34;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(220,220,220,0.8)'; ctx.lineWidth = 1; ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y);
+        ctx.moveTo(x1, y - 4); ctx.lineTo(x1, y + 4);
+        ctx.moveTo(x2, y - 4); ctx.lineTo(x2, y + 4); ctx.stroke();
+        ctx.font = '11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        const halfWidth = ctx.measureText(label).width / 2 + 6;
+        const center = Math.max(margin.left + halfWidth, Math.min(margin.left + plotW - halfWidth, (x1 + x2) / 2));
+        ctx.fillStyle = 'rgba(30,30,30,0.9)'; ctx.fillRect(center - halfWidth, y - 9, halfWidth * 2, 18);
+        ctx.fillStyle = '#ddd'; ctx.fillText(label, center, y); ctx.restore();
+      }
+    }
     // -- crosshair (mouse hover) --
     if (mousePos) {
       const cx = mousePos.x;
@@ -413,42 +526,26 @@ export function TimelineApp() {
       }
     }
 
-  }, [entries, timePerDiv, renderTick, mousePos]);
+  }, [entries, timePerDiv, renderTick, mousePos, cursorA, cursorB]);
 
   useEffect(() => { draw(); }, [draw]);
 
   useEffect(() => {
     if (!initedRef.current) return;
-    const width = timePerDiv * H_DIV;
-    tEndRef.current = clampTimelineViewportEnd(tEndRef.current, width, historyBoundsRef.current);
     scheduleVisibleRangeRequest();
+    if (lastHoverClientX.current > 0) {
+      computeHoverRef.current(lastHoverClientX.current, lastHoverClientY.current);
+    }
   }, [timePerDiv]);
 
-  // Save state to extension whenever entries or timePerDiv change (after init)
+  const saveLatestRef = useRef(saveState);
+  saveLatestRef.current = saveState;
+  const stateSaveTimer = useRef<number | null>(null);
   useEffect(() => {
-    if (initedRef.current) saveState();
-  }, [entries, timePerDiv, saveState]);
-
-  // Save autoFollow changes
-  useEffect(() => {
-    if (initedRef.current) {
-      vscode.postMessage({
-        command: 'saveState',
-        state: {
-          autoFollow,
-          timePerDiv,
-          entries: entries.map(e => ({
-            expression: e.expression,
-            enabled: e.enabled,
-            color: e.color,
-            yPerDiv: e.yPerDiv,
-            yAutoScale: e.yAutoScale,
-            yCenter: e.yCenter,
-          })),
-        },
-      });
-    }
-  }, [autoFollow]);
+    if (!initedRef.current || stateSaveTimer.current !== null) return;
+    stateSaveTimer.current = window.setTimeout(() => { stateSaveTimer.current = null; saveLatestRef.current(); }, 400);
+  }, [entries, timePerDiv, autoFollow, cursorA, cursorB]);
+  useEffect(() => () => { if (stateSaveTimer.current !== null) window.clearTimeout(stateSaveTimer.current); if (initedRef.current) saveLatestRef.current(); }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -464,20 +561,21 @@ export function TimelineApp() {
   const addExpr = () => {
     const expr = newExpr.trim();
     if (!expr) return;
-    vscode.postMessage({ command: 'addExpression', expression: expr });
+    sendMessage({ command: 'addExpression', expression: expr });
     setNewExpr('');
   };
 
   const toggle = (expr: string, enabled: boolean) => {
     setEntries(prev => prev.map(e => e.expression === expr ? { ...e, enabled } : e));
-    vscode.postMessage({ command: 'toggleExpression', expression: expr, enabled });
+    sendMessage({ command: 'toggleExpression', expression: expr, enabled });
   };
 
   const remove = (expr: string) => {
+    if (!debugEditable) return;
     setEntries(prev => prev.filter(e => e.expression !== expr));
     allDataRef.current.delete(expr);
     setRenderTick(t => t + 1);
-    vscode.postMessage({ command: 'removeExpression', expression: expr });
+    sendMessage({ command: 'removeExpression', expression: expr });
   };
 
   const setYPerDiv = (expr: string, value: number) => {
@@ -490,7 +588,7 @@ export function TimelineApp() {
     setEntries(prev => prev.map(e =>
       e.expression === expr ? { ...e, color } : e
     ));
-    vscode.postMessage({ command: 'setColor', expression: expr, color });
+    sendMessage({ command: 'setColor', expression: expr, color });
   };
 
   const setYAutoScale = (expr: string) => {
@@ -508,31 +606,48 @@ export function TimelineApp() {
     for (const key of map.keys()) map.set(key, []);
     updateHistoryBounds(null);
     setRenderTick(t => t + 1);
-    vscode.postMessage({ command: 'clearData' });
+    sendMessage({ command: 'clearData' });
   };
 
-  const zoomIn = () => setTimePerDiv(t => {
-    const idx = TIME_PRESETS.indexOf(t);
-    if (idx > 0) return TIME_PRESETS[idx - 1];
-    return t / 2;
-  });
-  const zoomOut = () => setTimePerDiv(t => {
-    const idx = TIME_PRESETS.indexOf(t);
-    if (idx < TIME_PRESETS.length - 1) return TIME_PRESETS[idx + 1];
-    return t * 2;
-  });
+  const applyTimeZoom = (nextTimePerDiv: number, anchorFraction = 0.5) => {
+    if (!Number.isFinite(nextTimePerDiv) || nextTimePerDiv <= 0) return;
+    nextTimePerDiv = clampTimelineTimePerDiv(nextTimePerDiv);
+    const previousTimePerDiv = timePerDivRef.current;
+    if (nextTimePerDiv === previousTimePerDiv) return;
+    // Preserve the time under the anchor, including at recording boundaries.
+    // Clamping here would shift that time when zooming out near an edge.
+    tEndRef.current += (nextTimePerDiv - previousTimePerDiv) * H_DIV * (1 - anchorFraction);
+    timePerDivRef.current = nextTimePerDiv;
+    autoFollowRef.current = false;
+    setAutoFollow(false);
+    rangeControllerRef.current!.cancelPendingRequests();
+    setTimePerDiv(nextTimePerDiv);
+    setRenderTick(t => t + 1);
+    scheduleVisibleRangeRequest();
+  };
+  const zoomBy = (direction: -1 | 1, anchorFraction = 0.5) => {
+    const current = timePerDivRef.current;
+    const nextPreset = direction > 0
+      ? TIMELINE_TIME_PRESETS_MS.find(preset => preset > current)
+      : [...TIMELINE_TIME_PRESETS_MS].reverse().find(preset => preset < current);
+    applyTimeZoom(nextPreset ?? (direction > 0 ? current * 2 : current / 2), anchorFraction);
+  };
+  const zoomIn = () => zoomBy(-1);
+  const zoomOut = () => zoomBy(1);
+  const zoomByRef = useRef(zoomBy);
+  zoomByRef.current = zoomBy;
 
   // hover — compute cursor time + values per variable
   const computeHover = useCallback((clientX: number, clientY?: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const margin = { top: 8, right: 12, bottom: 28, left: 12 };
+    const margin = { top: PLOT_TOP_MARGIN, right: 12, bottom: 28, left: PLOT_LEFT_MARGIN };
     const plotW = rect.width - margin.left - margin.right;
     const plotH = rect.height - margin.top - margin.bottom;
     if (plotW <= 0) return;
     const relX = clientX - rect.left - margin.left;
-    if (relX < 0 || relX > plotW) { setMousePos(null); setHoverVals(null); return; }
+    if (relX < 0 || relX > plotW || (clientY !== undefined && (clientY < rect.top + margin.top || clientY > rect.bottom - margin.bottom))) { setMousePos(null); setHoverVals(null); return; }
 
     const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDiv * H_DIV;
@@ -550,25 +665,13 @@ export function TimelineApp() {
     for (const entry of active) {
       const pts = map.get(entry.expression);
       if (!pts || pts.length === 0) continue;
-      // Find the actual data value at cursor time by interpolating between nearest points
+      const index = firstPointAtOrAfter(pts, cursorTime);
+      const left = pts[index - 1], right = pts[index];
       let display = '';
-      let lo = 0, hi = pts.length - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (pts[mid].timestamp < cursorTime) lo = mid + 1; else hi = mid;
-      }
-      // lo is now the first point with timestamp >= cursorTime
-      if (lo === 0) {
-        display = formatNum(pts[0].value);
-      } else if (lo >= pts.length) {
-        display = formatNum(pts[pts.length - 1].value);
-      } else {
-        // Interpolate between pts[lo-1] and pts[lo]
-        const p0 = pts[lo - 1], p1 = pts[lo];
-        const t = (cursorTime - p0.timestamp) / (p1.timestamp - p0.timestamp || 1);
-        const interpVal = p0.value + t * (p1.value - p0.value);
-        display = formatNum(interpVal);
-      }
+      if (left && right && !startsTimelineSegment(right, left)) {
+        const nearest = cursorTime - left.timestamp <= right.timestamp - cursorTime ? left : right;
+        display = formatNum(nearest.value);
+      } else if (right?.timestamp === cursorTime) display = formatNum(right.value);
       vals.push({ label: entry.expression, value: display, color: entry.color });
     }
     setHoverVals(vals.length > 0 ? vals : null);
@@ -576,31 +679,68 @@ export function TimelineApp() {
   const computeHoverRef = useRef(computeHover);
   computeHoverRef.current = computeHover;
 
-  // mouse drag to pan
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (e.button !== 0) return;
-    isDraggingRef.current = true;
-    dragStartXRef.current = e.clientX;
-    dragStartTEndRef.current = tEndRef.current;
-    setAutoFollow(false);
-    autoFollowRef.current = false;
+  const cursorAt = (clientX: number, clientY: number): 'A' | 'B' | null => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect || clientY < rect.top + 8 || clientY > rect.bottom - 28 || rect.width <= 24) return null;
+    const start = tEndRef.current - timePerDivRef.current * H_DIV;
+    const hits = Object.entries(cursorRef.current)
+      .filter(([, time]) => time !== null)
+      .map(([label, time]) => ({ label, distance: Math.abs(clientX - rect.left - 12 - (time! - start) / (timePerDivRef.current * H_DIV) * (rect.width - 24)) }))
+      .filter(hit => hit.distance <= 8)
+      .sort((a, b) => a.distance - b.distance);
+    return (hits[0]?.label as 'A' | 'B' | undefined) ?? null;
   };
 
-  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // A click places a cursor; movement past the threshold pans the viewport.
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0 || capturedPointerRef.current !== null) return;
+    e.preventDefault();
+    capturedPointerRef.current = e.pointerId;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    cursorDragRef.current = cursorAt(e.clientX, e.clientY);
+    isDraggingRef.current = false;
+    pointerDownRef.current = cursorDragRef.current === null;
+    dragStartXRef.current = e.clientX;
+    dragStartTEndRef.current = tEndRef.current;
+    if (cursorDragRef.current) {
+      setAutoFollow(false);
+      autoFollowRef.current = false;
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (capturedPointerRef.current !== null && e.pointerId !== capturedPointerRef.current) return;
+    if (cursorDragRef.current) {
+      const rect = canvasRef.current!.getBoundingClientRect();
+      const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left - 12) / (rect.width - 24)));
+      const time = tEndRef.current - timePerDivRef.current * H_DIV * (1 - fraction);
+      if (cursorDragRef.current === 'A') setCursorA(time); else setCursorB(time);
+      computeHover(e.clientX, e.clientY);
+      return;
+    }
+    if (pointerDownRef.current && !isDraggingRef.current && Math.abs(e.clientX - dragStartXRef.current) > 4) {
+      // Follow may advance while the button is held still. Anchor at the
+      // viewport that is actually visible when panning begins.
+      dragStartTEndRef.current = tEndRef.current;
+      isDraggingRef.current = true;
+      setAutoFollow(false);
+      autoFollowRef.current = false;
+    }
     if (isDraggingRef.current) {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const margin = { top: 8, right: 12, bottom: 28, left: 12 };
-      const plotW = rect.width - margin.left - margin.right;
+      const plotW = canvas.getBoundingClientRect().width - 24;
       if (plotW <= 0) return;
-      const deltaX = e.clientX - dragStartXRef.current;
-      const deltaTime = (deltaX / plotW) * timePerDiv * H_DIV;
       const viewportWidth = timePerDivRef.current * H_DIV;
+      const deltaTime = (e.clientX - dragStartXRef.current) / plotW * viewportWidth;
+      const bounds = historyBoundsRef.current;
+      // Keep empty space introduced by zoom instead of snapping on the first drag.
+      const panBounds = bounds ? {
+        start: Math.min(bounds.start, dragStartTEndRef.current),
+        end: Math.max(bounds.end, dragStartTEndRef.current),
+      } : null;
       tEndRef.current = clampTimelineViewportEnd(
-        dragStartTEndRef.current - deltaTime,
-        viewportWidth,
-        historyBoundsRef.current,
+        dragStartTEndRef.current - deltaTime, viewportWidth, panBounds, true,
       );
       setRenderTick(t => t + 1);
       scheduleVisibleRangeRequest();
@@ -608,50 +748,91 @@ export function TimelineApp() {
     computeHover(e.clientX, e.clientY);
   };
 
-  const handleMouseUp = () => {
+  const finishPointerGesture = (e?: React.PointerEvent<HTMLCanvasElement>) => {
+    const pointerId = capturedPointerRef.current;
+    if (pointerId === null || (e && e.pointerId !== pointerId)) return;
+    if (e?.button === 0 && pointerDownRef.current && !isDraggingRef.current && !cursorDragRef.current) {
+      const rect = canvasRef.current!.getBoundingClientRect();
+      const fraction = (e.clientX - rect.left - 12) / (rect.width - 24);
+      if (fraction >= 0 && fraction <= 1 && e.clientY >= rect.top + 8 && e.clientY <= rect.bottom - 28) {
+        const time = tEndRef.current - timePerDivRef.current * H_DIV * (1 - fraction);
+        if (cursorRef.current.A === null) setCursorA(time);
+        else if (cursorRef.current.B === null) setCursorB(time);
+      }
+    }
+    capturedPointerRef.current = null;
+    cursorDragRef.current = null;
+    pointerDownRef.current = false;
     isDraggingRef.current = false;
+    const canvas = canvasRef.current;
+    if (canvas?.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
+    saveState();
     if (rangeRequestTimerRef.current !== null) {
       window.clearTimeout(rangeRequestTimerRef.current);
       rangeRequestTimerRef.current = null;
     }
     requestVisibleRange();
   };
-  const handleCanvasMouseLeave = () => {
-    handleMouseUp();
+  const finishGestureRef = useRef(finishPointerGesture);
+  finishGestureRef.current = finishPointerGesture;
+  useEffect(() => {
+    const cancel = () => finishGestureRef.current();
+    window.addEventListener('blur', cancel);
+    return () => window.removeEventListener('blur', cancel);
+  }, []);
+  const handleContextMenu = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const cursor = cursorAt(e.clientX, e.clientY);
+    if (!cursor) {
+      onToggleFollow(true);
+      computeHover(e.clientX, e.clientY);
+      return;
+    }
+    if (cursor === 'A') setCursorA(null); else setCursorB(null);
+    cursorDragRef.current = null;
+    pointerDownRef.current = false;
+    isDraggingRef.current = false;
+  };
+  const handlePointerLeave = () => {
     setMousePos(null);
     setHoverVals(null);
   };
 
   // handle auto-follow toggle
   const onToggleFollow = (follow: boolean) => {
+    if (rangeRequestTimerRef.current !== null) {
+      window.clearTimeout(rangeRequestTimerRef.current);
+      rangeRequestTimerRef.current = null;
+    }
+    rangeControllerRef.current!.cancelPendingRequests();
     setAutoFollow(follow);
     autoFollowRef.current = follow;
     if (follow && latestSampleTimestampRef.current > 0) {
       tEndRef.current = latestSampleTimestampRef.current;
     }
+    setRenderTick(t => t + 1);
     requestVisibleRange();
   };
 
-  // wheel + drag via ref (passive:false for preventDefault)
+  // Zoom around the pointer; keep the installed listener current through a ref.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const dir = e.deltaY > 0 ? 1 : -1;
-      setTimePerDiv(t => {
-        const idx = TIME_PRESETS.indexOf(t);
-        if (dir > 0 && idx < TIME_PRESETS.length - 1) return TIME_PRESETS[idx + 1];
-        if (dir < 0 && idx > 0) return TIME_PRESETS[idx - 1];
-        return t;
-      });
+      if (e.deltaY === 0) return;
+      const rect = canvas.getBoundingClientRect();
+      const plotWidth = rect.width - 24;
+      if (plotWidth <= 0) return;
+      const anchorFraction = Math.min(1, Math.max(0, (e.clientX - rect.left - 12) / plotWidth));
+      zoomByRef.current(e.deltaY > 0 ? 1 : -1, anchorFraction);
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', onWheel);
   }, []);
 
   const onSetTimePerDiv = (val: number) => {
-    if (val > 0 && val <= 30000) setTimePerDiv(val);
+    applyTimeZoom(val);
   };
 
   useLayoutEffect(() => {
@@ -666,22 +847,38 @@ export function TimelineApp() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Toolbar
+        debugEditable={debugEditable}
         newExpr={newExpr} onNewExpr={setNewExpr} onAdd={addExpr}
         onClear={clearAll} onZoomIn={zoomIn} onZoomOut={zoomOut}
         timePerDiv={timePerDiv} autoFollow={autoFollow} onToggleFollow={onToggleFollow}
         onSetTimePerDiv={onSetTimePerDiv}
       />
+      <div style={{ display: 'grid', gridTemplateColumns: `${VARIABLE_LIST_WIDTH}px minmax(0, 1fr)`, alignItems: 'center', padding: `${EXPORT_ROW_PADDING}px 0`, fontSize: 11 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, paddingLeft: 8, whiteSpace: 'nowrap' }}>
+          <button style={iconBtnStyle} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'all' }); }}>保存全部 CSV</button>
+          <button style={iconBtnStyle} disabled={cursorA === null || cursorB === null} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'selection' }); }}>保存 A/B 区间</button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'flex-end', alignSelf: 'end', gap: 8, paddingLeft: PLOT_LEFT_MARGIN, minWidth: 0 }}>
+          <span title={kind === 'history' ? '平均采样率' : '实时采样率'} aria-label={kind === 'history' ? '平均采样率' : '实时采样率'} style={{ display: 'inline-flex', flexShrink: 0, gap: 0, position: 'relative', top: PLOT_TOP_MARGIN + EXPORT_ROW_PADDING - 3, zIndex: 1, color: 'var(--vscode-descriptionForeground, #aaa)', fontFamily: 'monospace', fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+            <span style={{ display: 'inline-block', minWidth: '4ch' }}>{kind === 'live' ? sampleRateHz.toFixed(0) : kind === 'history' ? averageSampleRateHz?.toFixed(0) ?? '—' : '—'}</span>
+            <span>Hz</span>
+          </span>
+          {rangeError && <span role="alert" style={{ color: 'var(--vscode-errorForeground)' }}>{rangeError}</span>}
+        </div>
+      </div>
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <VariableList
           entries={entries} allDataRef={allDataRef} onToggle={toggle} onRemove={remove}
           onSetYPerDiv={setYPerDiv} onSetYAutoScale={setYAutoScale}
-          onSetColor={setColor}
+          onSetColor={setColor} removable={debugEditable}
         />
         <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
           <canvas ref={canvasRef}
-            style={{ width: '100%', height: '100%', display: 'block' }}
-            onMouseDown={handleMouseDown} onMouseMove={handleCanvasMouseMove}
-            onMouseUp={handleMouseUp} onMouseLeave={handleCanvasMouseLeave}
+            style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
+            onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
+            onPointerUp={finishPointerGesture} onPointerLeave={handlePointerLeave}
+            onPointerCancel={() => finishPointerGesture()} onLostPointerCapture={() => finishPointerGesture()}
+            onContextMenu={handleContextMenu}
           />
           {mousePos && hoverVals && hoverVals.length > 0 && (
             <div ref={hoverTooltipRef} style={{
@@ -708,7 +905,8 @@ export function TimelineApp() {
   );
 }
 
-function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, timePerDiv, autoFollow, onToggleFollow, onSetTimePerDiv }: {
+function Toolbar({ debugEditable, newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, timePerDiv, autoFollow, onToggleFollow, onSetTimePerDiv }: {
+  debugEditable: boolean;
   newExpr: string; onNewExpr: (v: string) => void; onAdd: () => void;
   onClear: () => void; onZoomIn: () => void; onZoomOut: () => void;
   timePerDiv: number; autoFollow: boolean; onToggleFollow: (v: boolean) => void;
@@ -722,8 +920,8 @@ function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, time
 
   const commitTime = (raw: string) => {
     setPending('');
-    const v = parseFloat(raw);
-    if (!isNaN(v) && v > 0 && v <= 30000) onSetTimePerDiv(v);
+    const value = parseTimelineTimePerDiv(raw);
+    if (value !== undefined) onSetTimePerDiv(value);
   };
 
   return (
@@ -737,7 +935,7 @@ function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, time
         placeholder="变量名" style={inputStyle} />
       <button onClick={onAdd} style={btnStyle}>+</button>
       <div style={{ flex: 1 }} />
-      <button onClick={onZoomOut} style={iconBtnStyle} title="放大时间">−</button>
+      <button onClick={onZoomOut} disabled={timePerDiv >= MAX_TIMELINE_TIME_PER_DIV_MS} style={iconBtnStyle} title="放大时间">−</button>
       <input type="text" inputMode="decimal"
         value={pending || displayTime}
         onChange={e => setPending(e.target.value)}
@@ -750,7 +948,7 @@ function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, time
           ...miniInputStyle, width: 55, textAlign: 'center', fontSize: 10,
           color: '#fff',
         }}
-        title="输入时间/div (ms)"
+        title="输入时间/div（ms 或 s，最大 100s）"
       />
       <span style={{ fontSize: 9, color: 'var(--vscode-descriptionForeground, #888)' }}>/div</span>
       <button onClick={onZoomIn} style={iconBtnStyle} title="缩小时间">+</button>
@@ -760,12 +958,13 @@ function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, time
           style={{ cursor: 'pointer', margin: 0 }} />
         追踪
       </label>
-      <button onClick={onClear} style={iconBtnStyle} title="清除数据">清除</button>
+      {debugEditable && <button onClick={onClear} style={iconBtnStyle} title="结束当前记录并开始新记录">新记录</button>}
     </div>
   );
 }
 
-function VariableList({ entries, allDataRef, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor }: {
+function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor }: {
+  removable: boolean;
   entries: Entry[];
   allDataRef: React.MutableRefObject<Map<string, DataPoint[]>>;
   onToggle: (expr: string, en: boolean) => void;
@@ -796,7 +995,7 @@ function VariableList({ entries, allDataRef, onToggle, onRemove, onSetYPerDiv, o
   if (entries.length === 0) {
     return (
       <div style={{
-        width: 180, flexShrink: 0, fontSize: 11, padding: 8,
+        width: VARIABLE_LIST_WIDTH, boxSizing: 'border-box', flexShrink: 0, fontSize: 11, padding: 8,
         borderRight: '1px solid var(--vscode-sideBar-border, #333)',
         color: 'var(--vscode-descriptionForeground, #888)', textAlign: 'center', paddingTop: 20,
       }}>
@@ -806,7 +1005,7 @@ function VariableList({ entries, allDataRef, onToggle, onRemove, onSetYPerDiv, o
   }
   return (
     <div style={{
-      width: 180, flexShrink: 0, fontSize: 11, overflow: 'auto',
+      width: VARIABLE_LIST_WIDTH, boxSizing: 'border-box', flexShrink: 0, fontSize: 11, overflow: 'auto',
       borderRight: '1px solid var(--vscode-sideBar-border, #333)',
     }}>
       {entries.map(e => (
@@ -846,12 +1045,12 @@ function VariableList({ entries, allDataRef, onToggle, onRemove, onSetYPerDiv, o
               }} title={raw}>{latest}</span>
             );
           })()}
-          <button onClick={() => onRemove(e.expression)}
+          {removable && <button onClick={() => onRemove(e.expression)}
             style={{
               background: 'none', border: 'none', cursor: 'pointer',
               color: 'var(--vscode-errorForeground, #f48771)',
               fontSize: 11, padding: '0 2px', flexShrink: 0,
-            }}>×</button>
+            }}>×</button>}
           <div style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 2, marginTop: 1 }}>
             <input type="text" inputMode="decimal"
               value={getDisplay(e)}

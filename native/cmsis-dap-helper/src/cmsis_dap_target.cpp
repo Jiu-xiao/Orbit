@@ -396,6 +396,16 @@ Result CmsisDapTarget::readMemory(uint32_t address, uint32_t size, std::vector<u
   return Result::success();
 }
 
+size_t CmsisDapTarget::maxScatteredReadsPerPacket() const {
+  size_t capacity = packetSize_;
+  const size_t transportCapacity = protocol_->payloadCapacity();
+  if (transportCapacity != 0) capacity = std::min(capacity, transportCapacity);
+  // SELECT/CSW + N * (TAR, AP DRW, DP RDBUFF); two read words per scalar.
+  const size_t requestCapacity = capacity >= 20 ? (capacity - 13) / 7 : 0;
+  const size_t responseCapacity = capacity >= 11 ? (capacity - 3) / 8 : 0;
+  return std::min({requestCapacity, responseCapacity, size_t((255u - 2u) / 3u)});
+}
+
 Result CmsisDapTarget::readMemoryScattered32(
     const std::vector<uint32_t>& addresses, std::vector<uint32_t>& values,
     uint32_t& completedReads, DapTransferDiagnostics& diag,
@@ -412,17 +422,7 @@ Result CmsisDapTarget::readMemoryScattered32(
   }
   if (addresses.empty()) return Result::success();
 
-  size_t capacity = packetSize_;
-  const size_t transportCapacity = protocol_->payloadCapacity();
-  if (transportCapacity != 0) capacity = std::min(capacity, transportCapacity);
-  // Request: [cmd,dap,count] + SELECT/CSW writes (10 bytes) +
-  // N * [TAR write (5), AP DRW read (1), DP RDBUFF read (1)].
-  // Response: [cmd,count,status] + N * two 32-bit read values.
-  const size_t requestCapacity = capacity >= 20 ? (capacity - 13) / 7 : 0;
-  const size_t responseCapacity = capacity >= 11 ? (capacity - 3) / 8 : 0;
-  const size_t transferCountCapacity = (255u - 2u) / 3u;
-  const size_t maxReadsPerPacket =
-      std::min({requestCapacity, responseCapacity, transferCountCapacity});
+  const size_t maxReadsPerPacket = maxScatteredReadsPerPacket();
   if (maxReadsPerPacket == 0) {
     return Result::error(ErrorCodes::kPacketTooLarge,
                          "CMSIS-DAP packet capacity is too small for one scattered read");

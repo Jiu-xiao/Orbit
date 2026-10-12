@@ -358,3 +358,130 @@ describe('OzoneBackend multi-level pointer support', () => {
     expect(values[0].value).toBeCloseTo(3.14, 0.01);
   });
 });
+
+describe('OzoneBackend indexed fast sampling paths', () => {
+  function fixture() {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    internal.symbols = [
+      { name: 'chassis', address: 0x20000100, size: 4 },
+      { name: 'motors', address: 0x20003000, size: 64 },
+      { name: 'motor_ptr', address: 0x20000104, size: 4 },
+      { name: 'matrix', address: 0x20004000, size: 16 },
+    ];
+    internal.dwarfInfo = {
+      varToType: new Map([
+        ['chassis', 'chassis-ptr'], ['motors', 'motor-array'],
+        ['motor_ptr', 'motor-ptr'], ['matrix', 'matrix'],
+      ]),
+      typeDefs: new Map([
+        ['float', { name: 'float', kind: 'base', byteSize: 4, encoding: 'float' }],
+        ['chassis-ptr', { name: 'Chassis*', kind: 'pointer', byteSize: 4, typeOffset: 'chassis' }],
+        ['chassis', { name: 'Chassis', kind: 'struct', byteSize: 32, fields: [
+          { name: 'chassis_motor', typeOffset: 'motor-ptr-array', byteOffset: 8 },
+          { name: 'values', typeOffset: 'float-array', byteOffset: 16 },
+        ] }],
+        ['motor-ptr-array', { name: 'Motor*[2]', kind: 'array', byteSize: 8, typeOffset: 'motor-ptr', arrayCount: 2 }],
+        ['motor-array', { name: 'Motor[2]', kind: 'array', byteSize: 64, typeOffset: 'motor', arrayCount: 2 }],
+        ['motor-ptr', { name: 'Motor*', kind: 'pointer', byteSize: 4, typeOffset: 'motor' }],
+        ['motor', { name: 'Motor', kind: 'struct', byteSize: 32, fields: [
+          { name: 'message', typeOffset: 'message', byteOffset: 4 },
+        ] }],
+        ['message', { name: 'Message', kind: 'struct', byteSize: 16, fields: [
+          { name: 'out_velocity', typeOffset: 'float', byteOffset: 8 },
+        ] }],
+        ['float-array', { name: 'float[2]', kind: 'array', byteSize: 8, typeOffset: 'float', arrayCount: 2 }],
+        ['matrix', { name: 'float[2][2]', kind: 'array', byteSize: 16, typeOffset: 'float-array', arrayCount: 2 }],
+      ]),
+    };
+    const memory = new Map<number, Uint8Array>();
+    const put = (address: number, value: number, pointer = false) => {
+      const view = new DataView(new ArrayBuffer(4));
+      if (pointer) view.setUint32(0, value, true);
+      else view.setFloat32(0, value, true);
+      memory.set(address, new Uint8Array(view.buffer));
+    };
+    put(0x20000100, 0x20001000, true);
+    put(0x20000104, 0x20003000, true);
+    put(0x20001008, 0x20002000, true);
+    put(0x2000100c, 0x20002100, true);
+    for (const address of [0x2000200c, 0x2000210c, 0x2000302c, 0x20001014, 0x2000400c]) put(address, 12.5);
+    const reads: Array<{ address: number; size: number }> = [];
+    internal.targetReadMemory = async (address, size) => {
+      reads.push({ address, size });
+      return memory.get(address) || null;
+    };
+    return { backend, internal, memory, reads, put };
+  }
+
+  async function plan(backend: OzoneBackend, expression: string) {
+    const result = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: [expression] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    return (result.data as Array<{ expression: string; spec?: FastDataSampleSpec; error?: string }>)[0];
+  }
+
+  it.each([
+    ['chassis->chassis_motor[0]->message.out_velocity', 0x2000200c],
+    ['chassis->chassis_motor[1]->message.out_velocity', 0x2000210c],
+    ['chassis.chassis_motor[1].message.out_velocity', 0x2000210c],
+    ['chassis -> chassis_motor [ 1 ] -> message . out_velocity', 0x2000210c],
+    ['chassis->values[1]', 0x20001014],
+    ['motors[1].message.out_velocity', 0x2000302c],
+    ['motor_ptr[1].message.out_velocity', 0x2000302c],
+    ['matrix[1][1]', 0x2000400c],
+  ])('samples %s using the declared element stride', async (expression, address) => {
+    const { backend, reads } = fixture();
+    const item = await plan(backend, expression);
+    expect(item.spec).toBeDefined();
+    const result = await backend.execute({ cmd: 'readFastDataSampling', specs: [item.spec!] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    expect((result.data as Array<unknown>)[0]).toMatchObject({ expression, address, value: 12.5 });
+    expect(reads.at(-1)).toEqual({ address, size: 4 });
+  });
+
+  it.each([
+    'chassis->chassis_motor[2]->message.out_velocity',
+    'chassis->chassis_motor[-1]->message.out_velocity',
+    'chassis->chassis_motor[i]->message.out_velocity',
+    'chassis->chassis_motor[9007199254740993]->message.out_velocity',
+    'chassis->chassis_motor[0]->message->out_velocity',
+    'chassis->chassis_motor[0]->message.out_velocity[0]',
+    'chassis->chassis_motor[0]->message.out_velocity;',
+    'motor_ptr[4294967295].message.out_velocity',
+    'matrix[0][2]',
+  ])('rejects unsafe or unsupported path %s before any target read', async expression => {
+    const { backend, reads } = fixture();
+    expect(await plan(backend, expression)).toMatchObject({ expression, error: expect.any(String) });
+    expect((await plan(backend, expression)).spec).toBeUndefined();
+    expect(reads).toEqual([]);
+  });
+
+  it.each(['null', 'short', 'overflow'])('stops safely on an indexed element pointer that is %s', async failure => {
+    const { backend, memory, reads, put } = fixture();
+    if (failure === 'null') put(0x2000100c, 0, true);
+    else if (failure === 'short') memory.set(0x2000100c, new Uint8Array(2));
+    else put(0x2000100c, 0xfffffffc, true);
+    const item = await plan(backend, 'chassis->chassis_motor[1]->message.out_velocity');
+    expect(item.spec?.pointerChain).toEqual([
+      { pointerAddress: 0x20000100, offset: 0 },
+      { pointerAddress: 0, offset: 12 },
+      { pointerAddress: 0, offset: 12 },
+    ]);
+    const result = await backend.execute({ cmd: 'readFastDataSampling', specs: [item.spec!] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    expect((result.data as Array<{ error?: string }>)[0].error).toContain('read failed');
+    expect(reads.map(read => read.address)).toEqual([0x20000100, 0x2000100c]);
+  });
+
+  it('rejects an overflowing direct address and an unknown array element size', async () => {
+    const { backend, internal, reads } = fixture();
+    internal.symbols.find(symbol => symbol.name === 'motors')!.address = 0xfffffff0;
+    expect((await plan(backend, 'motors[1].message.out_velocity')).spec).toBeUndefined();
+    internal.dwarfInfo.typeDefs.get('motor')!.byteSize = 0;
+    expect((await plan(backend, 'chassis->chassis_motor[0][1].message.out_velocity')).spec).toBeUndefined();
+    expect(reads).toEqual([]);
+  });
+});

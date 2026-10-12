@@ -516,6 +516,8 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private state: 'idle' | 'opened' | 'connected' | 'failed' = 'idle';
   private lastDevice: CmsisDapDeviceInfo | null = null;
   private flashTargetDef: FlashTargetDefinition | null = null;
+  private timelineBatchLogAt = performance.now();
+  private timelineBatchTotals = { requests: 0, reads: 0, bytes: 0, queueMs: 0, rpcMs: 0, helperMs: 0, packets: 0, waitRetries: 0, faultClears: 0 };
 
   /** Registry definition of the connected device; null when unregistered. */
   get flashTarget(): FlashTargetDefinition | null {
@@ -852,6 +854,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       );
     }
     if (!result.ok) {
+      log.dap(`[cmsis-dap] readMemoryBatch failed owner=cmsis-dap target=${result.targetState} elapsedMs=${result.elapsedMs} errorCode=${result.errorCode || 'unknown'} diagnostics=${JSON.stringify(result.diagnostics || {})}`);
       const { data: _partialData, ...failureResult } = result;
       return failureResult as CppJLinkResult<{ reads: Array<{ address: number; bytes: Uint8Array }> }>;
     }
@@ -885,7 +888,29 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       address: item.address,
       bytes: Uint8Array.from(item.bytes),
     }));
-    log.dap(`[cmsis-dap] readMemoryBatch reads=${results.length} bytes=${results.reduce((sum, item) => sum + item.bytes.length, 0)} owner=cmsis-dap`);
+    const byteCount = results.reduce((sum, item) => sum + item.bytes.length, 0);
+    if (options?.priority === 'timeline') {
+      const totals = this.timelineBatchTotals;
+      totals.requests++;
+      totals.reads += results.length;
+      totals.bytes += byteCount;
+      const diag = result.diagnostics || {};
+      for (const [field, source] of [
+        ['queueMs', 'queueWaitMs'], ['rpcMs', 'rpcElapsedMs'], ['helperMs', 'helperProcessingMs'],
+        ['packets', 'packets'], ['waitRetries', 'waitRetries'], ['faultClears', 'faultClears'],
+      ] as const) {
+        const value = diag[source];
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) totals[field] += value;
+      }
+      const now = performance.now();
+      if (now - this.timelineBatchLogAt >= 1000) {
+        log.dap(`[cmsis-dap] timeline batch summary owner=cmsis-dap transport=${diag.transport || 'unknown'} target=${result.targetState} windowMs=${(now - this.timelineBatchLogAt).toFixed(1)} ${JSON.stringify(totals)}`);
+        this.timelineBatchLogAt = now;
+        for (const field of Object.keys(totals) as Array<keyof typeof totals>) totals[field] = 0;
+      }
+    } else {
+      log.dap(`[cmsis-dap] readMemoryBatch reads=${results.length} bytes=${byteCount} owner=cmsis-dap`);
+    }
     return {
       ok: true,
       message: result.message,

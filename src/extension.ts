@@ -5,6 +5,7 @@ import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
+import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { AutomationApiLifecycle } from './plugin-api/automation-api-lifecycle';
@@ -297,6 +298,10 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }
 
+    const svdCacheRoot = path.join(context.globalStorageUri.fsPath, 'svd-cache');
+    const svdDownloads = new SvdBackgroundDownloader();
+    context.subscriptions.push(svdDownloads);
+
     context.subscriptions.push(
       vscode.window.registerWebviewViewProvider('ozoneWatch', wvp),
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
@@ -304,11 +309,11 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
       vscode.debug.registerDebugConfigurationProvider(
         'orbit',
-        new OzoneDebugConfigurationProvider(path.join(context.globalStorageUri.fsPath, 'svd-cache'))
+        new OzoneDebugConfigurationProvider(svdCacheRoot)
       ),
       vscode.debug.registerDebugConfigurationProvider(
         'ozone',
-        new OzoneDebugConfigurationProvider(path.join(context.globalStorageUri.fsPath, 'svd-cache'))
+        new OzoneDebugConfigurationProvider(svdCacheRoot)
       ),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
         if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {
@@ -376,7 +381,16 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       }),
       vscode.debug.onDidStartDebugSession((session) => {
-        if (isOrbitDebugSessionType(session.type)) setActiveWatchSession(session);
+        if (isOrbitDebugSessionType(session.type)) {
+          setActiveWatchSession(session);
+          if (!session.configuration.svdFile && !session.configuration.svdPath) {
+            void svdDownloads.start(String(session.configuration.device ?? session.configuration.deviceName ?? ''), {
+              workspaceRoot: session.workspaceFolder?.uri.fsPath,
+              cacheRoot: svdCacheRoot,
+              allowDownload: getOrbitConfiguration().get<boolean>('svdAutoDownload', true),
+            });
+          }
+        }
         sessionRegistry.onStarted(session);
       }),
       vscode.debug.onDidChangeActiveDebugSession((session) => {
@@ -666,4 +680,5 @@ export async function deactivate() {
   await apiFastSampleSink?.dispose();
   sessionRegistry?.dispose();
   eventHub?.dispose();
+  await timelineProvider?.dispose();
 }

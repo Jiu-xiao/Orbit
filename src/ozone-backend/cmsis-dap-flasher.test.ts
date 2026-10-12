@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
+  STM32F103C8T6,
   STM32F407VET6,
   STM32F407IG,
   STM32H723VGT6,
@@ -10,6 +11,7 @@ import {
   CmsisDapFlashError,
   coalesceFlashProgramRanges,
   FlashTargetDefinition,
+  FlashAlgorithmRunRequest,
   flashCmsisDapElf,
   listBuiltinFlashAlgorithms,
   listFlashTargets,
@@ -78,6 +80,159 @@ function makeElf(segments: TestSegment[], overrides: Partial<{
   });
   return bytes;
 }
+
+describe('STM32F103C8T6 CMSIS-DAP flash model', () => {
+  it.each(['STM32F103C8T6', 'STM32F103C8', ' stm32f103c8t6 '])('resolves %s to the 64 KiB profile', device => {
+    expect(resolveFlashTarget(device)).toBe(STM32F103C8T6);
+    expect(() => validateTargetDeviceName(device, STM32F103C8T6)).not.toThrow();
+  });
+
+  it.each(['STM32F103CB', 'STM32F103CBT6', 'STM32F103C8T7', 'STM32F103', 'GD32F103C8T6'])(
+    'rejects an unregistered density/package or compatible part: %s', device => {
+      expect(() => resolveFlashTarget(device)).toThrow();
+      expect(() => validateTargetDeviceName(device, STM32F103C8T6)).toThrow();
+    },
+  );
+
+  it('tiles exactly 64 pages and accepts every page independently', () => {
+    expect(STM32F103C8T6.flashSize).toBe(0x10000);
+    expect(STM32F103C8T6.sectors).toHaveLength(64);
+    for (let number = 0; number < 64; number++) {
+      const address = 0x08000000 + number * 0x400;
+      const pages = calculateEraseSectors(parseElf32LoadSegments(makeElf([{ address, bytes: [1] }])), STM32F103C8T6);
+      expect(pages).toEqual([{ number, address, size: 0x400 }]);
+    }
+    expect(calculateEraseSectors(parseElf32LoadSegments(makeElf([
+      { address: 0x080003FF, bytes: [1, 2] },
+      { address: 0x0800FFFF, bytes: [3] },
+    ])), STM32F103C8T6).map(page => page.number)).toEqual([0, 1, 63]);
+    expect(() => calculateEraseSectors(parseElf32LoadSegments(makeElf([
+      { address: 0x0800FFFF, bytes: [1, 2] },
+    ])), STM32F103C8T6)).toThrow(/outside/);
+  });
+
+  it('validates the 20 KiB RAM window, .data LMA and BSS without erasing RAM', () => {
+    const segments = parseElf32LoadSegments(makeElf([
+      { address: 0x20004FFE, loadAddress: 0x0800FFFE, bytes: [1, 2] },
+      { address: 0x20004FFD, memorySize: 1 },
+    ]));
+    expect(calculateEraseSectors(segments, STM32F103C8T6).map(page => page.number)).toEqual([63]);
+    expect(() => calculateEraseSectors(parseElf32LoadSegments(makeElf([
+      { address: 0x20004FFF, memorySize: 2 },
+    ])), STM32F103C8T6)).toThrow(/outside/);
+    const image = loadFlashAlgorithm(STM32F103C8T6);
+    expect(path.basename(image.path)).toBe('orbit-stm32f103c8-flash-algorithm.bin');
+    expect(image.pageSize).toBe(1024);
+    expect(image.preservesPageBuffer).toBe(true);
+    const layout = planFlashRamLayout(STM32F103C8T6, image.code.length, image.pageSize);
+    expect(layout.algorithm.address).toBe(0x20000000);
+    expect(layout.pageBuffer.address + layout.pageBuffer.size).toBeLessThanOrEqual(layout.stack.address);
+    expect(layout.stackPointer).toBe(0x20005000);
+    expect(() => planFlashRamLayout(STM32F103C8T6, 0x4000, 1024)).toThrow(/do not fit/);
+  });
+
+  it('merges split halfwords and pads odd addresses/tails before page slicing', () => {
+    const ranges = coalesceFlashProgramRanges(parseElf32LoadSegments(makeElf([
+      { address: 0x08000001, bytes: [0x11, 0x22] },
+      { address: 0x20000000, loadAddress: 0x08000003, bytes: [0x33] },
+      { address: 0x0800FFFF, bytes: [0x44] },
+    ])), STM32F103C8T6);
+    expect(ranges.map(range => [range.address, Array.from(range.bytes)])).toEqual([
+      [0x08000000, [0xFF, 0x11, 0x22, 0x33]], [0x0800FFFE, [0xFF, 0x44]],
+    ]);
+    expect(() => validateFlashTargetDefinition({ ...STM32F103C8T6, programAlignment: 4 })).toThrow(/programAlignment/);
+  });
+
+  it.each([
+    [0x1BA01477, 0x410, 64, undefined, true],
+    [0x2BA01477, 0x410, 64, undefined, false],
+    [0x1BA01477, 0x413, 64, undefined, false],
+    [0x1BA01477, 0x410, 128, undefined, false],
+    [0x1BA01477, 0x410, 32, undefined, false],
+    [0x1BA01477, 0x410, 64, 3, false],
+  ] as const)('preflights DP=%i DEV_ID=%i capacity=%i pageSize=%s before Flash', async (dp, id, capacity, pageSize, success) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-f103c8-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      fs.writeFileSync(elfPath, makeElf([
+        { address: 0x080003FF, bytes: [0x12, 0x34] },
+        { address: 0x0800FFFF, bytes: [0x56] },
+      ]));
+      const calls: FlashAlgorithmRunRequest[] = [];
+      const reads: number[] = [];
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: dp }; },
+        async readMemory(address) {
+          reads.push(address);
+          if (address === 0xE0042000) return { ok: true, bytes: [id & 0xFF, id >> 8, 0, 0x20] };
+          if (address === 0x1FFFF7E0) return { ok: true, bytes: [capacity, 0] };
+          throw new Error(`unexpected read at ${address.toString(16)}`);
+        },
+        async runAlgorithm(request) {
+          calls.push(request);
+          return { ok: true, message: 'mock complete', data: {
+            returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003,
+          } };
+        },
+      }, elfPath, 'STM32F103C8', { pageSize }, STM32F103C8T6);
+      expect(result.success).toBe(success);
+      if (!success) {
+        expect(result.errorCode).toBe(pageSize ? 'InvalidConfiguration' : 'TargetMismatch');
+        expect(calls).toEqual([]);
+        return;
+      }
+      expect(reads).toEqual([0xE0042000, 0x1FFFF7E0]);
+      expect(result.erasedSectors.map(page => page.number)).toEqual([0, 1, 63]);
+      expect(calls.map(call => call.operation)).toEqual([
+        'init', 'eraseSector', 'eraseSector', 'eraseSector', 'programPage', 'verify', 'programPage', 'verify', 'uninit',
+      ]);
+      const programs = calls.filter(call => call.operation === 'programPage');
+      expect(programs.map(call => [call.targetAddress, call.data])).toEqual([
+        [0x080003FE, [0xFF, 0x12, 0x34, 0xFF]], [0x0800FFFE, [0xFF, 0x56]],
+      ]);
+      for (const call of calls) {
+        expect(call.ramSize).toBe(20 * 1024);
+        expect(call.stackPointer).toBe(0x20005000);
+        expect(call.flashStatusAddress).toBe(0x4002200C);
+        expect(call.flashControlAddress).toBe(0x40022010);
+      }
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('STM32F103C8T6 upload slicing', () => {
+  it('pads a large odd-start ELF payload and uploads each halfword exactly once', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-f103c8-slices-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const payload = Array.from({ length: 1501 }, (_, index) => index & 0xFF);
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x08000001, bytes: payload }]));
+      const programs: FlashAlgorithmRunRequest[] = [];
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: 0x1BA01477 }; },
+        async readMemory(address) {
+          return { ok: true, bytes: address === 0xE0042000 ? [0x10, 0x04, 0, 0x20] : [64, 0] };
+        },
+        async runAlgorithm(request) {
+          if (request.operation === 'programPage') programs.push(request);
+          return { ok: true, message: 'mock complete', data: {
+            returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003,
+          } };
+        },
+      }, elfPath, 'STM32F103C8T6', {}, STM32F103C8T6);
+      expect(result.success).toBe(true);
+      expect(result.erasedSectors.map(page => page.number)).toEqual([0, 1]);
+      expect(programs.map(request => [request.targetAddress, request.size])).toEqual([
+        [0x08000000, 1024], [0x08000400, 478],
+      ]);
+      expect(programs.flatMap(request => request.data)).toEqual([0xFF, ...payload]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('STM32F407IG CMSIS-DAP flash model', () => {
   it.each(['STM32F407IG', 'STM32F407IGT6', 'STM32F407IGT7', 'STM32F407IGH6', 'STM32F407IGH7', ' stm32f407ig '])(
@@ -842,7 +997,7 @@ describe('CMSIS-DAP flash target registry', () => {
       expect(mismatch.message).toContain('STM32F407VET6');
       expect(mismatch.diagnostics).toMatchObject({
         device: 'STM32F429VGT6',
-        supportedTargets: ['STM32F407VET6', 'STM32F407IG', 'STM32H723VGT6'],
+        supportedTargets: ['STM32F407VET6', 'STM32F407IG', 'STM32H723VGT6', 'STM32F103C8T6'],
       });
     }
   });

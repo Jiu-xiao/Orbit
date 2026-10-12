@@ -2,7 +2,7 @@
 
 This file records the references used for DAP-02A. The implementation does
 not vendor an FLM from a CMSIS-Pack, OpenOCD, or pyOCD distribution. The
-STM32F407 and STM32H723 images are compiled from the original sources in
+STM32F103C8, STM32F407 and STM32H723 images are compiled from the original sources in
 `native/cmsis-dap-flash-algorithm/`.
 
 ## References
@@ -99,3 +99,48 @@ user confirmed normal operation on the current IG board/firmware after the
 full-sector/bank coverage, additional probes/transports, and long-run/disconnect
 acceptance remain unverified. The confirmed fix is recorded in
 `docs/bug-fix-log.md`.
+
+## STM32F103C8T6 adaptation (2026-10-06)
+
+This profile registers exactly `STM32F103C8T6` and the project shorthand
+`STM32F103C8`. It uses the existing CMSIS-DAP owner, SWD/Cortex-M control,
+Flash RPC and scheduler. It does not register F103CB, other packages,
+GD32/CS32-compatible parts or undocumented capacity above 64 KiB.
+
+| Reference | Revision / location, accessed 2026-10-06 | Use / license judgment |
+| --- | --- | --- |
+| [ST STM32F103x8/xB datasheet](https://www.st.com/resource/en/datasheet/stm32f103t8.pdf) | DS5319 Rev 20, Table 2, section 2.3, Flash timing table in section 5.3 | C8: 64 KiB Flash, 20 KiB SRAM, Cortex-M3, 2.0–3.6 V; 1 KiB page erase maximum 40 ms and halfword program maximum 70 us. Documentation facts only; no copied code/image. |
+| [ST STM32F1 reference manual](https://www.st.com/resource/de/reference_manual/cd00171190.pdf) | RM0008 Rev 21, embedded Flash, RCC_CR, debug ID and device electronic signature chapters | Medium-density DEV_ID 0x410; Flash size is a 16-bit KiB value at 0x1FFFF7E0. The web reader could not open the full PDF due to its size; addresses/bit definitions were cross-checked against the official CMSIS device header below. |
+| [ST Flash programming manual](https://www.st.com/resource/en/programming_manual/pm0075-stm32f10xxx-flash-memory-microcontrollers-stmicroelectronics.pdf) | PM0075 Rev 2, Table 3, sections 2, 2.3.2–2.3.4 and 3 | 1 KiB erase pages, 16-bit main-Flash programming, unlock keys, HSI required, BSY/errors/EOP and register write restrictions. Register/sequencing facts only. |
+| [ST device errata](https://www.st.com/resource/en/errata_sheet/es096-stm32f101x8b-stm32f102x8b-and-stm32f103x8b-mediumdensity-device-limitations-stmicroelectronics.pdf) | ES096 Rev 15, section 2.2.11 | BSY rises one cycle after STRT; the SRAM loader inserts DSB and two NOPs before polling. Silicon revision has not been read on a board. |
+| [ST CMSIS F103xB device header](https://github.com/STMicroelectronics/cmsis-device-f1/blob/c8e9a4a4f16b6d2cb2a2083cbe5161025280fb22/Include/stm32f103xb.h) | Commit c8e9a4a4f16b6d2cb2a2083cbe5161025280fb22; peripheral map, FLASH_TypeDef and FLASH/RCC bit definitions | Cross-check 0x40022000 FPEC, 0x40021000 RCC, 0xE0042000 DBGMCU and capacity address. Repository [License.md](https://github.com/STMicroelectronics/cmsis-device-f1/blob/c8e9a4a4f16b6d2cb2a2083cbe5161025280fb22/License.md) is Apache-2.0. No ST implementation/header is bundled. |
+| [OpenOCD STM32F1 target description](https://github.com/openocd-org/openocd/blob/v0.12.0/tcl/target/stm32f1x.cfg) | v0.12.0, SW-DP ID declaration | Reference-only cross-check of DPIDR 0x1BA01477. GPL-2.0-or-later; no code is copied, translated, linked or used as an Orbit runtime path. |
+
+| Target/algorithm fact | Value / behavior |
+| --- | --- |
+| Main Flash | 0x08000000–0x0800FFFF; pages 0–63, each 1024 bytes; last page 0x0800FC00 |
+| SRAM / ELF and loader | 0x20000000–0x20004FFF; code at 0x20000000, 4-byte aligned page buffer after code, 4 KiB stack ending at 0x20005000 |
+| Preflight | DPIDR 0x1BA01477; DBGMCU at 0xE0042000, DEV_ID 0x410; 0x1FFFF7E0 must report exactly 64 KiB before Init/erase/program |
+| FPEC | KEYR +0x04, SR +0x0C, CR +0x10, AR +0x14; SR BSY b0 / PGERR b2 / WRPRTERR b4 / EOP b5; CR PG b0 / PER b1 / STRT b6 / LOCK b7 |
+| Programming | 2-byte granularity; merge ELF loads sharing a halfword, then pad odd addresses/tails with erased 0xFF before 1 KiB upload slices; ProgramPage batch limit 64 KiB, further bounded by available loader RAM |
+| Protection / clocks | Mask interrupts; enable HSI and wait for ready without changing SYSCLK/PLL/prefetch; never write option bytes or mass erase; UnInit locks FPEC; HSI remains on until reset |
+| Timing / failures | Bounded target polling; host erase/program defaults 5 s; return 1 timeout, 2 protection/lock, 3 program/verify/range error; do not write FPEC registers while still busy or replay unknown writes |
+| Image / ABI | Original Orbit MIT C source plus linker script, ARM GCC Cortex-M3 / Thumb / soft ABI; entry offsets 0x000/0x100/0x200/0x300/0x400, trusted BKPT at 0x500; no static data (R9/static_base 0), unchanged page buffer for Verify |
+| SVD | Existing resolver derives series STM32F103 / pack ID Keil.STM32F1xx_DFP for both names; user-supplied SVD precedence unchanged. Actual Pack/SVD download and Peripheral Viewer have not been verified; no SVD binary is bundled by this adaptation |
+
+Automation covers all page starts, cross-page payloads, the final valid Flash
+byte, SRAM/BSS and .data VMA/LMA bounds, halfword merging/padding, identity and
+capacity rejection before any algorithm operation, and selected-owner target
+resolution. The actual native helper mock uses the built F103 image within
+20 KiB RAM to check ABI/layout, first/last-page erase/program/Verify/read-back,
+misaligned and out-of-range requests, and stack overflow rejection. The mock
+emulates Flash effects; it does not execute the FPEC code on silicon.
+
+Hardware has not been connected or modified for this adaptation. HID and
+WinUSB Flash/debug, original chip markings/REV_ID, RAM stub, Init/UnInit,
+real ELF verification, Watch/Timeline/RTT, disconnect and long-run behavior
+remain pending board acceptance. Use the staged acceptance in
+`.agent/skills/cmsis-dap-add-target/references/acceptance.md` with an explicitly
+authorized board/ELF and test-page range. Reverting this profile, its optional
+host alignment, algorithm source/build entry and tests removes the adaptation;
+the existing F407/H723 profiles and their algorithm images remain independent.

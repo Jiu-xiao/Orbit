@@ -13,6 +13,27 @@ function request(seq: number, command: string, args: Record<string, unknown> = {
 }
 
 describe('DapSession realtime variable arbitration', () => {
+  it('includes rejected Timeline expressions in the failed DAP response message', async () => {
+    const expression = 'chassis->chassis_motor[i]->message.out_velocity';
+    const backend = {
+      execute: vi.fn(async () => ({ ok: true, data: [{ expression, error: 'unsupported index' }] })),
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    const sent: DebugProtocolMessage[] = [];
+    session.on('send', message => sent.push(message));
+    await (session as any).handleDataSamplingStart(request(900, 'dataSamplingStart', {
+      entries: [{ expression, color: '#4EC9B0' }],
+    }));
+    expect(sent.find(message => message.request_seq === 900)).toMatchObject({
+      success: false,
+      message: expect.stringContaining(`${expression}: unsupported index`),
+    });
+    expect((session as any).dataSamplingActive).toBe(false);
+    expect(backend.execute).toHaveBeenCalledOnce();
+    expect(backend.execute).toHaveBeenCalledWith({ cmd: 'prepareFastDataSampling', expressions: [expression] });
+  });
+
   it.each([
     ['4 * 1024 * 1024', 4194304],
     ['0x20000000 + 0x100', 0x20000100],

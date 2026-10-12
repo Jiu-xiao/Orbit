@@ -19,6 +19,12 @@ const MAX_INTERVAL_MS = 10000;
 
 export class DataSamplingManager {
   private entries: DataSamplingEntry[] = [];
+  private retainHistory = true;
+
+  setRetainHistory(enabled: boolean) {
+    this.retainHistory = enabled;
+    if (!enabled) for (const expression of this.dataMap.keys()) this.dataMap.set(expression, []);
+  }
   private dataMap = new Map<string, DataPoint[]>();
   private pendingMap = new Map<string, DataPoint[]>();
   private lastSampleTimestampMap = new Map<string, number>();
@@ -192,16 +198,29 @@ export class DataSamplingManager {
         sampleIntervalMs: this.sampleIntervalMs,
         sendIntervalMs: this.sendIntervalMs,
       });
-      if (response?.ok === false) throw new Error(response?.message || 'remote sampler rejected expressions');
       if (generation !== this.samplingGeneration || vscode.debug.activeDebugSession !== session) {
         try { await session.customRequest('dataSamplingStop', {}); } catch {}
         return;
       }
+      const rejected = Array.isArray(response?.planned)
+        ? response.planned.filter((item: any) => item?.error && !item.spec)
+        : [];
+      const rejectionDetails = rejected.map((item: any) => `${item.expression}（${item.error}）`).join('；');
+      if (response?.ok === false) throw new Error(rejectionDetails || response?.message || 'remote sampler rejected expressions');
+      if (rejected.length > 0) {
+        void vscode.window.showWarningMessage(
+          `Timeline 无法采样：${rejectionDetails}`,
+        );
+      }
       this.remoteSession = session;
       this.remoteSampling = true;
-    } catch {
+    } catch (error) {
+      if (generation !== this.samplingGeneration || vscode.debug.activeDebugSession !== session) return;
       this.remoteSession = null;
       this.remoteSampling = false;
+      void vscode.window.showWarningMessage(
+        `Timeline 采样启动失败：${error instanceof Error ? error.message : String(error)}`,
+      );
       const activeSession = vscode.debug.activeDebugSession;
       if ((!activeSession || !isOrbitDebugSessionType(activeSession.type)) && !this.timer) this.startSampling();
     }
@@ -296,7 +315,7 @@ export class DataSamplingManager {
       };
       this.lastSampleTimestampMap.set(entry.expression, now);
       const pts = this.dataMap.get(entry.expression);
-      if (pts) {
+      if (pts && this.retainHistory) {
         pts.push(pt);
         trimTimelineHistory(pts);
       }
@@ -330,8 +349,10 @@ export class DataSamplingManager {
       const entry = entryByExpression.get(snapshot.expression);
       if (!entry || !Array.isArray(snapshot.data) || snapshot.data.length === 0) continue;
       const pts = this.dataMap.get(snapshot.expression) || [];
-      pts.push(...snapshot.data);
-      trimTimelineHistory(pts);
+      if (this.retainHistory) {
+        for (const point of snapshot.data) pts.push(point);
+        trimTimelineHistory(pts);
+      }
       this.dataMap.set(snapshot.expression, pts);
       accepted.push({
         expression: snapshot.expression,
@@ -351,7 +372,7 @@ export class DataSamplingManager {
       const pending = this.pendingMap.get(entry.expression);
       if (!pending || pending.length === 0) continue;
       const allData = this.dataMap.get(entry.expression) || [];
-      const currentValue = allData.length > 0 ? allData[allData.length - 1].display : '';
+      const currentValue = pending[pending.length - 1].display;
       snapshots.push({
         expression: entry.expression,
         color: entry.color,

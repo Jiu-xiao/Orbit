@@ -1,4 +1,4 @@
-import type { TimelineDataPoint } from './timeline-sample-buffer';
+import { startsTimelineSegment, type TimelineDataPoint } from './timeline-sample-buffer';
 
 export interface TimelineTraceViewport {
   tStart: number;
@@ -43,7 +43,7 @@ export function buildTimelineTraceCommands(
   const firstVisiblePoint = points[firstVisible];
   let hasPathStart = false;
 
-  if (predecessor && predecessor.timestamp < viewport.tStart && !firstVisiblePoint.startsNewSegment) {
+  if (predecessor && predecessor.timestamp < viewport.tStart && !startsTimelineSegment(firstVisiblePoint, predecessor)) {
     const span = firstVisiblePoint.timestamp - predecessor.timestamp;
     const predecessorY = viewport.projectY(predecessor);
     const firstVisibleY = viewport.projectY(firstVisiblePoint);
@@ -74,7 +74,7 @@ export function buildTimelineTraceCommands(
   for (let index = firstVisible; index < points.length; index++) {
     const point = points[index];
     if (point.timestamp > viewport.tEnd) break;
-    if (point.startsNewSegment) {
+    if (startsTimelineSegment(point, points[index - 1])) {
       flushColumn();
       column = Number.NaN;
       hasPathStart = false;

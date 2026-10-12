@@ -30,6 +30,12 @@ describe('calculateBufferedRange', () => {
 });
 
 describe('clampTimelineViewportEnd', () => {
+  it('allows panning a short recording without locking the viewport at its latest edge', () => {
+    const bounds = { start: 100, end: 500 };
+    expect(clampTimelineViewportEnd(250, 800, bounds, true)).toBe(250);
+    expect(clampTimelineViewportEnd(50, 800, bounds, true)).toBe(100);
+    expect(clampTimelineViewportEnd(600, 800, bounds, true)).toBe(500);
+  });
   it('keeps the viewport within the latest and earliest history edges', () => {
     const bounds = { start: 100, end: 500 };
     expect(clampTimelineViewportEnd(600, 200, bounds)).toBe(500);
@@ -136,6 +142,64 @@ describe('parseTimelineRangeLoadRequest', () => {
 });
 
 describe('TimelineRangeController', () => {
+  it('does not request batch boundaries after ten minutes of continuous live sampling', () => {
+    const controller = new TimelineRangeController();
+    controller.setResolution(1);
+    for (let start = 0; start < 600_000; start += 15) {
+      controller.setHistoryBounds({ start: 0, end: start + 12 });
+      controller.markLiveSamples([{ expression: 'counter', data: [point(start), point(start + 12)] }]);
+    }
+    expect(controller.requestViewport(599_197, 599_997)).toEqual([]);
+    // This also checks a wide view, which used to create tens of thousands of requests.
+    expect(controller.requestViewport(0, 599_997)).toEqual([]);
+  });
+
+  it('preserves real segment breaks and does not bridge unrelated expressions', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    controller.markLiveSamples([{ expression: 'a', data: [point(0), point(100)] }]);
+    controller.markLiveSamples([{ expression: 'b', data: [point(900), point(1000)] }]);
+    controller.markLiveSamples([{ expression: 'a', data: [{ ...point(500), startsNewSegment: true }, point(600)] }]);
+    expect(controller.requestViewport(0, 1000).map(({ start, end }) => ({ start, end }))).toEqual([
+      { start: 100, end: 500 }, { start: 600, end: 900 },
+    ]);
+  });
+
+  it('does not bridge missed live data after visibility or resolution changes', () => {
+    const controller = new TimelineRangeController();
+    controller.setResolution(1);
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    controller.markLiveSamples([{ expression: 'a', data: [point(0), point(100)] }]);
+    controller.resetLiveContinuity();
+    controller.markLiveSamples([{ expression: 'a', data: [point(900), point(1000)] }]);
+    expect(controller.requestViewport(0, 1000)).toHaveLength(1);
+    controller.setResolution(2);
+    controller.markLiveSamples([{ expression: 'a', data: [point(900), point(1000)] }]);
+    expect(controller.requestViewport(0, 1000)[0]).toMatchObject({ start: 0, end: 900 });
+  });
+
+  it('bounds fragmented backfill and still fills every missing interval', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 60_000 });
+    for (let start = 0; start < 60_000; start += 15) controller.markLoadedRange({ start, end: start + 12 });
+    const requests = controller.requestViewport(0, 60_000);
+    expect(requests).toHaveLength(4);
+    expect(controller.requestViewport(0, 60_000)).toEqual([]);
+    for (const request of requests) expect(controller.completeRequest(request.requestId, request)).toBe(true);
+    expect(controller.requestViewport(0, 60_000)).toEqual([]);
+  });
+
+  it('rejects abandoned historical replies when returning to follow at the same resolution', () => {
+    const controller = new TimelineRangeController();
+    controller.setResolution(1);
+    controller.setHistoryBounds({ start: 0, end: 600_000 });
+    const [historical] = controller.requestViewport(0, 800);
+    controller.cancelPendingRequests();
+    const [latest] = controller.requestViewport(599_200, 600_000);
+    expect(controller.completeRequest(historical.requestId, historical, controller.generation, 1)).toBe(false);
+    expect(controller.completeRequest(latest.requestId, latest, controller.generation, 1)).toBe(true);
+  });
+
   it('invalidates loaded and pending coverage when display resolution changes', () => {
     const controller = new TimelineRangeController();
     controller.setHistoryBounds({ start: 0, end: 1000 });
@@ -292,5 +356,19 @@ describe('TimelineRangeController', () => {
     expect(controller.requestViewport(100, 200)).toEqual([
       { requestId: lostRequest.requestId + 1, start: 0, end: 300 },
     ]);
+  });
+});
+
+
+describe('Timeline cache coverage eviction', () => {
+  it('reloads a previously visited interval after its display cache has been evicted', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    controller.setResolution(1);
+    controller.markLoadedRange({ start: 0, end: 1000 });
+    controller.retainCoverage({ start: 800, end: 1000 });
+    const requests = controller.requestViewport(100, 200);
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.some(request => request.start <= 100 && request.end >= 200)).toBe(true);
   });
 });

@@ -12,6 +12,33 @@ const bkptOffset = 0x500;
  * independent contract so a shared regression mistake on one target cannot
  * silently weaken the other target's checks.
  */
+function verifyF103Source(source) {
+  for (const required of [
+    '#define FLASH_BASE 0x08000000u',
+    '#define FLASH_END 0x08010000u',
+    '#define FLASH_PAGE_BYTES 0x400u',
+    '#define FLASH_REG_BASE 0x40022000u',
+    '#define FLASH_SR_BSY (1u << 0)',
+    '#define FLASH_SR_WRPRTERR (1u << 4)',
+    '#define FLASH_CR_STRT (1u << 6)',
+    '#define FLASH_CR_LOCK (1u << 7)',
+    'RCC_CR |= RCC_CR_HSION',
+    'FLASH_AR = adr',
+    'FLASH_CR |= FLASH_CR_PER',
+    'FLASH_CR |= FLASH_CR_PG',
+    '__asm volatile("dsb\\nnop\\nnop" ::: "memory")',
+    '((adr | sz) & 1u)',
+    'volatile uint16_t *destination',
+    '*destination = value',
+    'offset += 2u',
+  ]) {
+    if (!source.includes(required)) throw new Error(`STM32F103 FPEC contract is missing: ${required}`);
+  }
+  if (source.includes('FLASH_OPTKEYR') || source.includes('FLASH_ACR_ICRST')) {
+    throw new Error('STM32F103 loader must not program option bytes or use F4 cache reset registers');
+  }
+}
+
 function verifyF407Source(source) {
   // Keep VE and IG density boundaries independent of the host registry.
   for (const required of [
@@ -118,6 +145,12 @@ function verifyH723Source(source) {
 }
 
 const algorithms = [
+  {
+    name: 'stm32f103c8',
+    binaryFile: 'orbit-stm32f103c8-flash-algorithm.bin',
+    sourceFile: 'stm32f103c8_flash_algorithm.c',
+    verifySource: verifyF103Source,
+  },
   {
     name: 'stm32f407',
     binaryFile: 'orbit-stm32f407-flash-algorithm.bin',

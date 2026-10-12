@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { appendTimelineSamples, type TimelineDataPoint, type TimelineSampleSnapshot } from './timeline-sample-buffer';
+import { appendTimelineSamples, retainTimelineSamples, type TimelineDataPoint, type TimelineSampleSnapshot } from './timeline-sample-buffer';
 import { buildTimelineTraceCommands } from './timeline-trace-path';
 
 const point = (timestamp: number, value = timestamp): TimelineDataPoint => ({
@@ -15,6 +15,16 @@ const viewport = (tStart: number, tEnd: number) => ({
 });
 
 describe('buildTimelineTraceCommands', () => {
+  it.each(['segmentId', 'channelId'] as const)('does not interpolate across a CSV %s change when no explicit flag exists', identity => {
+    const points = [
+      { ...point(0, -10), segmentId: 1, channelId: 0 },
+      { ...point(100, 8), segmentId: 1, channelId: 0, [identity]: 2 },
+      { ...point(120, 9), segmentId: 1, channelId: 0, [identity]: 2 },
+    ];
+    const commands = buildTimelineTraceCommands(points, viewport(50, 150));
+    expect(commands[0].x).toBeGreaterThan(12);
+    expect(commands.filter(c => c.command === 'moveTo')).toHaveLength(1);
+  });
   it('interpolates the retained predecessor at the left edge without flushing its negative column', () => {
     const commands = buildTimelineTraceCommands([
       point(0, 0),
@@ -41,15 +51,17 @@ describe('buildTimelineTraceCommands', () => {
     expect(nextFrame.slice(1).every(command => command.command === 'lineTo')).toBe(true);
   });
 
-  it('retains the ten-minute predecessor but draws it only as a clipped boundary intersection', () => {
+  it('retains the viewport predecessor but draws it only as a clipped boundary intersection', () => {
     const existing = [point(0), point(30_000), point(31_000), point(600_000)];
     const snapshots: TimelineSampleSnapshot[] = [{
       expression: 'counter', color: '#4EC9B0', currentValue: '631001', data: [point(631_001)],
     }];
-    appendTimelineSamples(new Map([['counter', existing]]), snapshots);
+    const data = new Map([['counter', existing]]);
+    appendTimelineSamples(data, snapshots);
+    retainTimelineSamples(data, { start: 31_001, end: 631_001 });
 
-    expect(existing.map(sample => sample.timestamp)).toEqual([31_000, 600_000, 631_001]);
-    const commands = buildTimelineTraceCommands(existing, viewport(600_001, 631_001));
+    expect(data.get('counter')!.map(sample => sample.timestamp)).toEqual([31_000, 600_000, 631_001]);
+    const commands = buildTimelineTraceCommands(data.get('counter')!, viewport(600_001, 631_001));
     expect(commands[0]).toMatchObject({ command: 'moveTo', x: 12 });
     expect(commands.every(command => command.x >= 12)).toBe(true);
   });

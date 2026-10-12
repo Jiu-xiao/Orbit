@@ -391,7 +391,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     }));
   });
 
-  it.each(['STM32H723VGT6', 'STM32F407IG'])('exposes the %s flash target and clears it on disconnect', async device => {
+  it.each(['STM32H723VGT6', 'STM32F407IG', 'STM32F103C8T6'])('exposes the %s flash target and clears it on disconnect', async device => {
     const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
     const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => channel);
 
@@ -891,7 +891,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(mismatch).toMatchObject({
       ok: false,
       errorCode: 'TargetMismatch',
-      diagnostics: { ownerKind: 'cmsis-dap', supportedTargets: ['STM32F407VET6', 'STM32F407IG', 'STM32H723VGT6'] },
+      diagnostics: { ownerKind: 'cmsis-dap', supportedTargets: ['STM32F407VET6', 'STM32F407IG', 'STM32H723VGT6', 'STM32F103C8T6'] },
     });
     expect(mismatch.message).toContain('STM32F429VGT6');
     expect(helper.withControlCriticalSection).not.toHaveBeenCalled();

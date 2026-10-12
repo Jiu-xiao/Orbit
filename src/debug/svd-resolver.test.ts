@@ -30,6 +30,8 @@ afterEach(() => {
 
 describe('SVD device identification', () => {
   it.each([
+    ['STM32F103C8T6', 'STM32F103', 'F1', 'Keil.STM32F1xx_DFP'],
+    ['STM32F103C8', 'STM32F103', 'F1', 'Keil.STM32F1xx_DFP'],
     ['STM32F407IG', 'STM32F407', 'F4', 'Keil.STM32F4xx_DFP'],
     ['STM32F407IGT6', 'STM32F407', 'F4', 'Keil.STM32F4xx_DFP'],
     ['stm32h723zg', 'STM32H723', 'H7', 'Keil.STM32H7xx_DFP'],

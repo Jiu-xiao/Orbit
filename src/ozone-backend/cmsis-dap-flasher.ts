@@ -98,10 +98,41 @@ export interface FlashTargetDefinition {
    * per-byte STM32F4 semantics.
    */
   readonly flashWordSize?: number;
+  /** Host-side address/size alignment required by ProgramPage (F1: halfword). */
+  readonly programAlignment?: number;
   /** Per-operation timeouts scaled to the target's sector/page timing. */
   readonly eraseTimeoutMs: number;
   readonly programTimeoutMs: number;
 }
+
+/** STM32F103C8T6: DS5319, RM0008 and PM0075 medium-density FPEC. */
+export const STM32F103C8T6: FlashTargetDefinition = Object.freeze({
+  name: 'STM32F103C8T6',
+  aliases: ['STM32F103C8'],
+  dpIdcode: 0x1BA01477,
+  flashBase: 0x08000000,
+  flashSize: 64 * 1024,
+  sectors: Array.from({ length: 64 }, (_, number) => ({
+    number, address: 0x08000000 + number * 0x400, size: 0x400,
+  })),
+  ramRegions: [{ name: 'SRAM', address: 0x20000000, size: 20 * 1024 }],
+  loaderRamIndex: 0,
+  preflight: {
+    idcodeAddress: 0xE0042000,
+    // DEV_ID identifies the medium-density family, not the package.
+    deviceId: 0x410,
+    flashSizeRegisterAddress: 0x1FFFF7E0,
+    expectedFlashSizeKiB: 64,
+  },
+  flashDiagnostics: { statusAddress: 0x4002200C, controlAddress: 0x40022010 },
+  algorithm: 'stm32f103c8',
+  // FPEC programs one halfword at a time. Coalesce adjacent ELF loads before
+  // padding with erased bytes so each halfword is programmed only once.
+  flashWordSize: 2,
+  programAlignment: 2,
+  eraseTimeoutMs: 5000,
+  programTimeoutMs: 5000,
+});
 
 export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
   name: 'STM32F407VET6',
@@ -222,7 +253,7 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
   programTimeoutMs: 15000,
 });
 
-const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32F407IG, STM32H723VGT6];
+const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32F407IG, STM32H723VGT6, STM32F103C8T6];
 
 /** All registered flash targets, in registration order. */
 export function listFlashTargets(): readonly FlashTargetDefinition[] {
@@ -325,6 +356,15 @@ export function validateFlashTargetDefinition(target: FlashTargetDefinition): vo
       || (target.flashWordSize & (target.flashWordSize - 1)) !== 0
       || target.flashWordSize > 0x10000)) {
     fail(`Flash target ${target.name} flashWordSize must be a power of two in 1..65536`);
+  }
+  if (target.programAlignment !== undefined
+    && (!Number.isInteger(target.programAlignment)
+      || target.programAlignment < 1 || target.programAlignment > 0x10000
+      || (target.programAlignment & (target.programAlignment - 1)) !== 0
+      || target.programAlignment !== (target.flashWordSize ?? 1)
+      || target.flashBase % target.programAlignment !== 0
+      || target.flashSize % target.programAlignment !== 0)) {
+    fail(`Flash target ${target.name} programAlignment must match its aligned flashWordSize`);
   }
 }
 
@@ -534,6 +574,20 @@ export function coalesceFlashProgramRanges(
     merged.set(segment.bytes, segment.loadAddress - previous.address);
     previous.bytes = merged;
   }
+  // F1's FPEC accepts aligned halfwords only. Pad after merging so a split
+  // .text/.data LMA halfword is uploaded once, including odd start/tail bytes.
+  // Targets whose algorithms align internally retain their original ranges.
+  const alignment = target.programAlignment ?? 1;
+  if (alignment > 1) {
+    return ranges.map(range => {
+      const address = Math.floor(range.address / alignment) * alignment;
+      const end = Math.ceil((range.address + range.bytes.length) / alignment) * alignment;
+      const bytes = new Uint8Array(end - address);
+      bytes.fill(0xFF);
+      bytes.set(range.bytes, range.address - address);
+      return { address, bytes };
+    });
+  }
   return ranges;
 }
 
@@ -627,6 +681,16 @@ export interface BuiltinFlashAlgorithmMetadata {
 
 /** Built-in RAM Flash Algorithms referenced by FlashTargetDefinition.algorithm. */
 const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadata> = new Map([
+  [
+    'stm32f103c8',
+    Object.freeze({
+      fileName: 'orbit-stm32f103c8-flash-algorithm.bin',
+      entries: DEFAULT_ALGORITHM_ENTRIES,
+      staticBase: 0,
+      pageSize: 0x400,
+      preservesPageBuffer: true,
+    } satisfies BuiltinFlashAlgorithmMetadata),
+  ],
   [
     'stm32f407',
     Object.freeze({
@@ -984,6 +1048,10 @@ export async function flashCmsisDapElf(
     const algorithm = loadFlashAlgorithm(target, options.algorithmPath);
     const pageSize = options.pageSize || algorithm.pageSize;
     const pageBufferSize = options.pageBufferSize || pageSize;
+    if (pageSize % (target.programAlignment ?? 1) !== 0) {
+      throw new CmsisDapFlashError('InvalidConfiguration',
+        `Flash Algorithm page size must align to ${target.programAlignment} bytes for ${target.name}`);
+    }
     if (pageBufferSize < pageSize) {
       throw new CmsisDapFlashError(
         'InvalidConfiguration',

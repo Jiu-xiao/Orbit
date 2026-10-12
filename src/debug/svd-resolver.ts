@@ -30,7 +30,8 @@ export interface SvdResolverOptions {
   cacheRoot: string;
   allowDownload?: boolean;
   localPackRoots?: string[];
-  fetchBinary?: (url: string, maxBytes: number) => Promise<Buffer>;
+  signal?: AbortSignal;
+  fetchBinary?: (url: string, maxBytes: number, signal?: AbortSignal) => Promise<Buffer>;
 }
 
 export function identifySvdDevice(device: string): SvdDeviceIdentity | undefined {
@@ -52,6 +53,7 @@ export async function resolveSvdForDevice(
   device: string,
   options: SvdResolverOptions
 ): Promise<SvdResolution> {
+  options.signal?.throwIfAborted();
   const identity = identifySvdDevice(device);
   if (!identity) {
     return unavailable(`无法从芯片型号 ${device || '(空)'} 推导 STM32 SVD 名称`);
@@ -78,17 +80,29 @@ export async function resolveSvdForDevice(
     return unavailable(`未找到 ${identity.series}.svd，且 orbit.svdAutoDownload 已关闭`, identity.packId);
   }
 
+  // Socket inactivity timeouts do not bound DNS/connect/TLS or repeated redirects.
+  // Use one deadline for the metadata and pack together, including every redirect.
+  const downloadController = new AbortController();
+  const cancelDownload = () => downloadController.abort(options.signal?.reason);
+  options.signal?.addEventListener('abort', cancelDownload, { once: true });
+  if (options.signal?.aborted) cancelDownload();
+  const downloadTimeout = setTimeout(() => {
+    downloadController.abort(new Error('SVD Pack 下载超时（总时限 15 秒）'));
+  }, DOWNLOAD_TIMEOUT_MS);
   try {
+    downloadController.signal.throwIfAborted();
     const fetchBinary = options.fetchBinary ?? downloadBinary;
     const pdscUrl = `https://www.keil.com/pack/${identity.packId}.pdsc`;
-    const pdsc = (await fetchBinary(pdscUrl, MAX_PDSC_BYTES)).toString('utf8');
+    const pdsc = (await fetchBinary(pdscUrl, MAX_PDSC_BYTES, downloadController.signal)).toString('utf8');
+    downloadController.signal.throwIfAborted();
     const packVersion = latestPackVersion(pdsc);
     if (!packVersion) {
       return unavailable(`无法从 ${identity.packId}.pdsc 解析 Pack 版本`, identity.packId);
     }
 
     const packUrl = `https://www.keil.com/pack/${identity.packId}.${packVersion}.pack`;
-    const packBuffer = await fetchBinary(packUrl, MAX_PACK_BYTES);
+    const packBuffer = await fetchBinary(packUrl, MAX_PACK_BYTES, downloadController.signal);
+    downloadController.signal.throwIfAborted();
     const extracted = extractMatchingSvd(packBuffer, identity.series);
     if (!extracted) {
       return unavailable(
@@ -112,8 +126,12 @@ export async function resolveSvdForDevice(
       packVersion,
     };
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    const cause = downloadController.signal.aborted ? downloadController.signal.reason : error;
+    const detail = cause instanceof Error ? cause.message : String(cause);
     return unavailable(`自动获取 ${identity.series}.svd 失败：${detail}`, identity.packId);
+  } finally {
+    clearTimeout(downloadTimeout);
+    options.signal?.removeEventListener('abort', cancelDownload);
   }
 }
 
@@ -257,11 +275,16 @@ async function writeFileAtomic(destination: string, data: Buffer): Promise<void>
   }
 }
 
-function downloadBinary(url: string, maxBytes: number): Promise<Buffer> {
-  return downloadBinaryWithRedirects(url, maxBytes, MAX_REDIRECTS);
+function downloadBinary(url: string, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
+  return downloadBinaryWithRedirects(url, maxBytes, MAX_REDIRECTS, signal);
 }
 
-function downloadBinaryWithRedirects(url: string, maxBytes: number, redirectsLeft: number): Promise<Buffer> {
+function downloadBinaryWithRedirects(
+  url: string,
+  maxBytes: number,
+  redirectsLeft: number,
+  signal?: AbortSignal
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:') {
@@ -269,7 +292,7 @@ function downloadBinaryWithRedirects(url: string, maxBytes: number, redirectsLef
       return;
     }
 
-    const request = https.get(parsed, response => {
+    const request = https.get(parsed, { signal }, response => {
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400 && response.headers.location) {
         response.resume();
@@ -278,7 +301,7 @@ function downloadBinaryWithRedirects(url: string, maxBytes: number, redirectsLef
           return;
         }
         const redirectUrl = new URL(response.headers.location, parsed).toString();
-        downloadBinaryWithRedirects(redirectUrl, maxBytes, redirectsLeft - 1).then(resolve, reject);
+        downloadBinaryWithRedirects(redirectUrl, maxBytes, redirectsLeft - 1, signal).then(resolve, reject);
         return;
       }
       if (status !== 200) {
@@ -307,7 +330,6 @@ function downloadBinaryWithRedirects(url: string, maxBytes: number, redirectsLef
       response.on('end', () => resolve(Buffer.concat(chunks)));
       response.on('error', reject);
     });
-    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => request.destroy(new Error('SVD Pack 下载超时')));
     request.on('error', reject);
   });
 }

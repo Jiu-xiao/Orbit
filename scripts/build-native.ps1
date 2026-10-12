@@ -101,9 +101,9 @@ function Find-ArmGnuTool {
 
 function Build-FlashAlgorithm {
   param(
-    [ValidateSet('stm32f407', 'stm32f407ig', 'stm32h723')]
+    [ValidateSet('stm32f103c8', 'stm32f407', 'stm32f407ig', 'stm32h723')]
     [string]$Algorithm,
-    [ValidateSet('cortex-m4', 'cortex-m7')]
+    [ValidateSet('cortex-m3', 'cortex-m4', 'cortex-m7')]
     [string]$Cpu
   )
 
@@ -194,6 +194,7 @@ foreach ($entry in $projects) {
 }
 
 if ($Project -eq 'cmsis-dap' -or $Project -eq 'all') {
+  Build-FlashAlgorithm -Algorithm 'stm32f103c8' -Cpu 'cortex-m3'
   Build-FlashAlgorithm -Algorithm 'stm32f407' -Cpu 'cortex-m4'
   Build-FlashAlgorithm -Algorithm 'stm32f407ig' -Cpu 'cortex-m4'
   Build-FlashAlgorithm -Algorithm 'stm32h723' -Cpu 'cortex-m7'

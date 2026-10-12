@@ -29,6 +29,7 @@
 - **通过 J-Link / DAPLink 直接采样 MCU 变量**，不需要专门的波形上报代码，也不额外占用串口。
 - 支持多变量曲线、时间窗口缩放、游标读数和 CSV 导出。
 - A/B 时间游标测量时间差，可保存全部数据或游标区间，再通过 CSV 和多个标签页回看；长期记录持续写盘，查看历史时实时采集继续。
+- 坐标格上方显示实时采样率；调试结束、打开 CSV 或恢复记录后显示平均采样率。支持回看超过十分钟的数据，时间比例最大为 **100 s/div**。
 - **J-Link 采样可达 1 kHz，无线 DAPLink 有约 400 Hz 的使用记录。** 实际速率取决于目标、表达式数量和并行负载。
 
 [![Orbit TIMELINE：真实调试界面与多变量波形](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-timeline-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-timeline-promo.png)
@@ -87,7 +88,7 @@
 
 1. 在 VS Code 扩展页搜索 **Orbit STM32 Debugger**，选择扩展 ID 为 `orbit-debug.orbit-for-vscode` 的插件安装，也可以直接打开[插件市场页面](https://marketplace.visualstudio.com/items?itemName=orbit-debug.orbit-for-vscode)。需要离线安装时，从 [Releases](https://github.com/zhuangyan114/Orbit/releases) 下载 VSIX，再执行 `Extensions: Install from VSIX...`。安装后重新加载窗口。
 2. 打开固件工程文件夹，编译得到 ELF/AXF，连接开发板和探针。
-3. 新建 `.vscode/launch.json`。下面用 STM32F407IG 举例，**把芯片型号改成你自己的即可，ELF/AXF 文件会自动查找**：
+3. 在“运行和调试”中点击 **“创建一个 launch.json 文件”**，选择 **Orbit (J-Link / CMSIS-DAP)**。Orbit 会生成最小配置，只需填写 `device` 芯片型号，ELF/AXF 文件会自动查找。已有 `launch.json` 时，也可通过“添加配置”选择 **Orbit: 最小调试配置**。下面用 STM32F407IG 举例：
 
 ```jsonc
 {

@@ -24,6 +24,7 @@ interface PendingTimelineRange {
 const PREFETCH_RATIO = 2;
 const REFRESH_THRESHOLD_RATIO = 0.5;
 const MAX_TARGET_BUCKETS = 100_000;
+const MAX_PENDING_RANGE_REQUESTS = 4;
 
 export function parseTimelineRangeLoadRequest(value: unknown): TimelineRangeLoadRequest | null {
   if (!value || typeof value !== 'object') return null;
@@ -44,7 +45,16 @@ export function parseTimelineRangeLoadRequest(value: unknown): TimelineRangeLoad
     || (request.targetBuckets as number) > MAX_TARGET_BUCKETS) {
     return null;
   }
-  return request as TimelineRangeLoadRequest;
+  // Only protocol fields belong to a range request. Spreading the incoming
+  // webview message would also copy command: 'loadRange' into the response.
+  return {
+    requestId: request.requestId!,
+    generation: request.generation!,
+    start: request.start,
+    end: request.end,
+    resolutionKey: request.resolutionKey,
+    targetBuckets: request.targetBuckets!,
+  };
 }
 
 export function quantizeTimelineResolution(viewportWidthMs: number, plotWidthPx: number): number | null {
@@ -62,9 +72,10 @@ export function clampTimelineViewportEnd(
   requestedEnd: number,
   viewportWidth: number,
   historyBounds: TimelineHistoryBounds | null,
+  allowPartialHistory = false,
 ): number {
   if (!historyBounds || viewportWidth < 0 || !Number.isFinite(requestedEnd)) return requestedEnd;
-  const earliestEnd = Math.min(historyBounds.end, historyBounds.start + viewportWidth);
+  const earliestEnd = allowPartialHistory ? historyBounds.start : Math.min(historyBounds.end, historyBounds.start + viewportWidth);
   return Math.min(historyBounds.end, Math.max(earliestEnd, requestedEnd));
 }
 
@@ -196,6 +207,7 @@ export class TimelineRangeController {
   private nextRequestId = 1;
   private activeResolutionKey: number | null = null;
   private activeGeneration = 0;
+  private liveEnds = new Map<string, number>();
 
   get generation(): number {
     return this.activeGeneration;
@@ -242,7 +254,18 @@ export class TimelineRangeController {
       REFRESH_THRESHOLD_RATIO,
     );
     if (refreshRange && uncoveredRanges(refreshRange, coverage).length === 0) return [];
-    return uncoveredRanges(target, coverage).map(range => {
+    const available = MAX_PENDING_RANGE_REQUESTS - this.pending.size;
+    if (available <= 0) return [];
+    const gaps = uncoveredRanges(target, coverage);
+    // Coalesce fragmented coverage into a bounded number of host round trips.
+    // These requests may include already cached points, but never mark a gap
+    // loaded until the host actually answers it.
+    const groupSize = Math.max(1, Math.ceil(gaps.length / available));
+    const ranges: TimelineRange[] = [];
+    for (let index = 0; index < gaps.length; index += groupSize) {
+      ranges.push({ start: gaps[index].start, end: gaps[Math.min(index + groupSize, gaps.length) - 1].end });
+    }
+    return ranges.map(range => {
       const request = { requestId: this.nextRequestId++, ...range };
       this.pending.set(request.requestId, {
         range,
@@ -275,9 +298,42 @@ export class TimelineRangeController {
     if (clipped) this.loaded = mergeRanges([...this.loaded, clipped]);
   }
 
+  markLiveSamples(snapshots: readonly {
+    expression: string;
+    data: readonly { timestamp: number; startsNewSegment?: boolean }[];
+  }[]) {
+    for (const snapshot of snapshots) {
+      if (snapshot.data.length === 0) continue;
+      const previous = this.liveEnds.get(snapshot.expression);
+      let start = snapshot.data[0].timestamp;
+      if (previous !== undefined && previous <= start && !snapshot.data[0].startsNewSegment) start = previous;
+      let end = snapshot.data[0].timestamp;
+      for (let index = 1; index < snapshot.data.length; index++) {
+        const point = snapshot.data[index];
+        if (point.startsNewSegment) {
+          this.markLoadedRange({ start, end });
+          start = point.timestamp;
+        }
+        end = point.timestamp;
+      }
+      this.markLoadedRange({ start, end });
+      this.liveEnds.set(snapshot.expression, end);
+    }
+  }
+
+  resetLiveContinuity() {
+    this.liveEnds.clear();
+  }
+
   clearCoverage() {
     this.loaded = [];
     this.pending.clear();
+    this.resetLiveContinuity();
+  }
+
+  retainCoverage(range: TimelineRange) {
+    this.loaded = this.loaded.map(loaded => intersectTimelineRange(loaded, range)).filter((r): r is TimelineRange => r !== null);
+    for (const [id, pending] of this.pending) if (!intersectTimelineRange(pending.range, range)) this.pending.delete(id);
   }
 
   cancelPendingRequests() {

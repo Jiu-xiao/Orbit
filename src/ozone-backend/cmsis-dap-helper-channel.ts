@@ -118,6 +118,7 @@ export interface CmsisDapTransferDiagnostics {
 }
 
 export interface CmsisDapPerformanceSnapshot {
+  helperQueueWaitMs: MetricStats;
   helperRpcElapsedMs: MetricStats;
   helperProcessingMs: MetricStats;
   cmsisDap: {
@@ -133,6 +134,8 @@ export interface CmsisDapPerformanceSnapshot {
     effectiveReadBytes: number;
     packedReads: number;
     fallbackReads: number;
+    waitRetries: number;
+    faultClears: number;
     transport: string | null;
   };
   scheduler: ReturnType<NativeScheduler['snapshot']>;
@@ -328,6 +331,7 @@ export class CmsisDapHelperClient {
   private exitPromise: Promise<void> | null = null;
   private resolveExit: (() => void) | null = null;
   private readonly scheduler = new NativeScheduler();
+  private readonly helperQueueWaitMs = new BoundedMetric(8_192);
   private readonly helperRpcElapsedMs = new BoundedMetric(8_192);
   private readonly helperProcessingMs = new BoundedMetric(8_192);
   private readonly readTotals = {
@@ -341,6 +345,8 @@ export class CmsisDapHelperClient {
     effectiveReadBytes: 0,
     packedReads: 0,
     fallbackReads: 0,
+    waitRetries: 0,
+    faultClears: 0,
     transport: null as string | null,
   };
 
@@ -399,8 +405,17 @@ export class CmsisDapHelperClient {
     onStepResumed?: () => void,
   ): Promise<CppJLinkResult<T>> {
     const priority = schedule.priority || priorityForMethod(method);
+    const queuedAt = performance.now();
     return this.scheduler.schedule(
-      () => this.sendRequest<T>(method, params, onStepResumed),
+      async () => {
+        const queueWaitMs = performance.now() - queuedAt;
+        const result = await this.sendRequest<T>(method, params, onStepResumed);
+        if (method === 'readMemory' || method === 'readMemoryBatch') {
+          this.helperQueueWaitMs.record(queueWaitMs);
+          result.diagnostics = { ...result.diagnostics, queueWaitMs };
+        }
+        return result;
+      },
       { ...schedule, priority, label: schedule.label || method },
     );
   }
@@ -441,6 +456,7 @@ export class CmsisDapHelperClient {
 
   getPerformanceSnapshot(): CmsisDapPerformanceSnapshot {
     return {
+      helperQueueWaitMs: this.helperQueueWaitMs.snapshot(),
       helperRpcElapsedMs: this.helperRpcElapsedMs.snapshot(),
       helperProcessingMs: this.helperProcessingMs.snapshot(),
       cmsisDap: {
@@ -462,13 +478,13 @@ export class CmsisDapHelperClient {
     }
     const id = this.nextId++;
     return new Promise<CppJLinkResult<T>>((resolve, reject) => {
-      const sentAt = Date.now();
+      const sentAt = performance.now();
       const requestTimeoutMs = requestTimeoutFor(method, params, this.requestTimeoutMs);
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const child = this.child;
         this.onDiagnostic(
-          `[cmsis-dap protocol] ${method} timeout after=${Date.now() - sentAt}ms pid=${child?.pid ?? 'none'} `
+          `[cmsis-dap protocol] ${method} timeout after=${performance.now() - sentAt}ms pid=${child?.pid ?? 'none'} `
           + `exitCode=${child?.exitCode ?? 'null'} killed=${child?.killed ?? false} stdinWritable=${child?.stdin.writable ?? false}`,
         );
         reject(new Error(`CMSIS-DAP helper request timed out: ${method}`));
@@ -546,7 +562,7 @@ export class CmsisDapHelperClient {
     }
     clearTimeout(pending.timer);
     this.pending.delete(response.id);
-    const rpcElapsedMs = Date.now() - pending.sentAt;
+    const rpcElapsedMs = performance.now() - pending.sentAt;
     if (pending.method === 'readMemory' || pending.method === 'readMemoryBatch') {
       const result = response.result as CppJLinkResult<unknown>;
       const diagnostics = result.diagnostics || {};
@@ -556,7 +572,7 @@ export class CmsisDapHelperClient {
       for (const field of [
         'usbWriteReports', 'usbReadReports', 'usbReportBytes', 'protocolPayloadBytes',
         'dapTransferCount', 'dapTransferBlockCount', 'effectiveReadBytes',
-        'packedReads', 'fallbackReads',
+        'packedReads', 'fallbackReads', 'waitRetries', 'faultClears',
       ] as const) {
         const value = diagnostics[field];
         if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {

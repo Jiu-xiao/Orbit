@@ -150,6 +150,9 @@ class CmsisDapTarget {
       uint32_t& completedReads, DapTransferDiagnostics& diag,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
+  // Capacity accounts for both negotiated protocol and transport payload limits.
+  size_t maxScatteredReadsPerPacket() const;
+
   // Writes a byte-oriented range. Partial words are read-modify-written while
   // the target is halted, then all writes use the bounded block-write path.
   Result writeMemory(uint32_t address, const std::vector<uint8_t>& bytes,

@@ -108,6 +108,9 @@ export class OzoneBackend {
   private sessionGeneration = 0;
   private readonly fastPlanCache = new Map<string, FastDataSamplePlanItem[]>();
   private readonly planBuildElapsed = new BoundedMetric(2_048);
+  private readonly fastSamplingReadMs = new BoundedMetric(8_192);
+  private readonly fastSamplingFormatMs = new BoundedMetric(8_192);
+  private readonly fastSamplingCounts = { captures: 0, batchRequests: 0, fallbackReads: 0, cacheHits: 0 };
   private planCacheHit = 0;
   private planCacheMiss = 0;
   private planCacheInvalidation = 0;
@@ -442,6 +445,11 @@ case 'readVariableRuntime':
             ok: true,
             data: {
               owner: this.targetRegisterSource(),
+              fastSampling: {
+                ...this.fastSamplingCounts,
+                readMs: this.fastSamplingReadMs.snapshot(),
+                formatMs: this.fastSamplingFormatMs.snapshot(),
+              },
               planner: {
                 planCacheHit: this.planCacheHit,
                 planCacheMiss: this.planCacheMiss,
@@ -2891,141 +2899,94 @@ case 'readVariableRuntime':
   }
 
   private resolveFastDataSampleSpec(expression: string): FastDataSampleSpec | null {
-    const bracketMatch = expression.match(/^(\w+)\[(\d+)\]$/);
-    if (bracketMatch) {
-      const baseName = bracketMatch[1];
-      const index = parseInt(bracketMatch[2], 10);
-      const baseSym = this.findSymbolByName(baseName);
-      if (!baseSym) return null;
-      const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
-      const arrayType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-      if (!arrayType || arrayType.kind !== 'array' || index < 0 || (arrayType.arrayCount !== undefined && index >= arrayType.arrayCount)) return null;
-      const elemType = arrayType.typeOffset ? this.resolveDwarfType(arrayType.typeOffset) : null;
-      if (!this.isFastScalarType(elemType)) return null;
-      const size = this.getScalarReadSize(undefined, elemType);
-      const typeName = arrayType.typeOffset ? this.getDwarfTypeName(arrayType.typeOffset) : elemType?.typeName || elemType?.name || '';
-      return {
-        expression,
-        address: baseSym.address + index * size,
-        size,
-        typeName,
-        isFloat: this.isFloatType(elemType),
-        signed: this.isSignedIntegerType(elemType),
-        format: this.fastDataSampleFormat(elemType, typeName),
-      };
-    }
-
-    const fieldMatch = expression.match(/^(\w+)((?:\.|->)[A-Za-z_]\w*)+$/);
-    if (fieldMatch) {
-      const [, baseName] = fieldMatch;
-      const baseSym = this.findSymbolByName(baseName);
-      if (!baseSym) return null;
-      const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
-      const baseType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-      let currentType = baseType;
-      let fieldOffset = 0;
-      const pointerChain: Array<{ pointerAddress: number; offset: number }> = [];
-      let canUseArrow = currentType?.kind === 'pointer';
-
-      if (currentType?.kind === 'pointer') {
-        if (!currentType.typeOffset) return null;
-        pointerChain.push({ pointerAddress: baseSym.address, offset: 0 });
-        currentType = this.resolveDwarfType(currentType.typeOffset);
-      }
-
-      const segments = [...expression.slice(baseName.length).matchAll(/(\.|->)([A-Za-z_]\w*)/g)];
-      for (let index = 0; index < segments.length; index++) {
-        const [, operator, fieldName] = segments[index];
-        if (operator === '->' && !canUseArrow) return null;
-        if ((currentType?.kind !== 'struct' && currentType?.kind !== 'union') || !currentType.fields) return null;
-        const field = currentType.fields.find(candidate => candidate.name === fieldName);
-        if (!field) return null;
-        const fieldType = this.resolveDwarfType(field.typeOffset);
-        fieldOffset += field.byteOffset;
-
-        if (index < segments.length - 1) {
-          if (fieldType?.kind === 'pointer') {
-            if (!fieldType.typeOffset) return null;
-            if (pointerChain.length === 0) {
-              pointerChain.push({ pointerAddress: baseSym.address + fieldOffset, offset: 0 });
-            } else {
-              pointerChain.push({ pointerAddress: 0, offset: fieldOffset });
-            }
-            if (pointerChain.length > FAST_SAMPLE_MAX_POINTER_DEREFERENCES) return null;
-            currentType = this.resolveDwarfType(fieldType.typeOffset);
-            fieldOffset = 0;
-            canUseArrow = true;
-            continue;
-          }
-          if (fieldType?.kind !== 'struct' && fieldType?.kind !== 'union') return null;
-          currentType = fieldType;
-          canUseArrow = false;
-          continue;
-        }
-
-        // Final segment: must be a scalar
-        if (!this.isFastScalarType(fieldType)) return null;
-        const size = this.getScalarReadSize(undefined, fieldType);
-        const typeName = this.getDwarfTypeName(field.typeOffset) || fieldType?.typeName || fieldType?.name || '';
-        if (pointerChain.length >= 1) {
-          pointerChain.push({ pointerAddress: 0, offset: fieldOffset });
-
-          if (pointerChain.length === 2) {
-            return {
-              expression,
-              address: pointerChain[0].pointerAddress,
-              size,
-              pointerAddress: pointerChain[0].pointerAddress,
-              pointeeOffset: pointerChain[1].offset,
-              typeName,
-              isFloat: this.isFloatType(fieldType),
-              signed: this.isSignedIntegerType(fieldType),
-              format: this.fastDataSampleFormat(fieldType, typeName),
-            };
-          } else {
-            return {
-              expression,
-              address: pointerChain[0].pointerAddress,
-              size,
-              pointerChain,
-              typeName,
-              isFloat: this.isFloatType(fieldType),
-              signed: this.isSignedIntegerType(fieldType),
-              format: this.fastDataSampleFormat(fieldType, typeName),
-            };
-          }
-        } else {
-          // Direct access (no pointer)
-          return {
-            expression,
-            address: baseSym.address + fieldOffset,
-            size,
-            typeName,
-            isFloat: this.isFloatType(fieldType),
-            signed: this.isSignedIntegerType(fieldType),
-            format: this.fastDataSampleFormat(fieldType, typeName),
-          };
-        }
-      }
-    }
-
-    const sym = this.findSymbolByName(expression);
+    // Parse the entire path before planning reads; never accept a valid prefix
+    // of an unsupported expression (e.g. a variable index or trailing ';').
+    const path = expression.match(/^([A-Za-z_]\w*)((?:\s*(?:\.|->)\s*[A-Za-z_]\w*|\s*\[\s*\d+\s*\])*)$/);
+    if (!path) return null;
+    const sym = this.findSymbolByName(path[1]);
     if (!sym) return null;
-    const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
-    const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-    if (!resolvedType && sym.size > 8) return null;
-    if (!this.isFastScalarType(resolvedType)) return null;
-    const size = this.getScalarReadSize(sym.size, resolvedType);
-    const typeName = varTypeOffset ? this.getDwarfTypeName(varTypeOffset) : resolvedType?.typeName || resolvedType?.name || '';
-    return {
+    let typeOffset = this.dwarfInfo.varToType.get(sym.name);
+    let currentType = typeOffset ? this.resolveDwarfType(typeOffset) : null;
+    let offset = 0;
+    const pointerChain: Array<{ pointerAddress: number; offset: number }> = [];
+
+    const addOffset = (delta: number): boolean => {
+      if (!Number.isSafeInteger(delta) || delta < 0) return false;
+      const next = offset + delta;
+      if (!Number.isSafeInteger(next) || next > 0xFFFF_FFFF) return false;
+      offset = next;
+      return true;
+    };
+    const dereference = (): boolean => {
+      if (currentType?.kind !== 'pointer' || !currentType.typeOffset
+        || (currentType.byteSize && currentType.byteSize !== 4)
+        || pointerChain.length >= FAST_SAMPLE_MAX_POINTER_DEREFERENCES) return false;
+      if (pointerChain.length === 0) {
+        const address = this.checkedFastSampleAddress(sym.address, offset, 4);
+        if (address === null) return false;
+        pointerChain.push({ pointerAddress: address, offset: 0 });
+      } else {
+        pointerChain.push({ pointerAddress: 0, offset });
+      }
+      typeOffset = currentType.typeOffset;
+      currentType = this.resolveDwarfType(typeOffset);
+      offset = 0;
+      return !!currentType;
+    };
+
+    const segments = path[2].matchAll(/(?:\.|->)\s*([A-Za-z_]\w*)|\[\s*(\d+)\s*\]/g);
+    for (const segment of segments) {
+      if (segment[1] !== undefined) {
+        if (currentType?.kind === 'pointer') {
+          // Retain Watch/Timeline's existing implicit pointer access via '.'.
+          if (!dereference()) return null;
+        } else if (segment[0].startsWith('->')) return null;
+        if ((currentType?.kind !== 'struct' && currentType?.kind !== 'union') || !currentType.fields) return null;
+        const field = currentType.fields.find(candidate => candidate.name === segment[1]);
+        if (!field || !addOffset(field.byteOffset)) return null;
+        typeOffset = field.typeOffset;
+        currentType = this.resolveDwarfType(typeOffset);
+      } else {
+        const index = Number(segment[2]);
+        if (!Number.isSafeInteger(index) || index < 0) return null;
+        if (currentType?.kind === 'pointer') {
+          if (!dereference()) return null;
+        } else {
+          if (currentType?.kind !== 'array' || !currentType.typeOffset
+            || (currentType.arrayCount !== undefined && index >= currentType.arrayCount)) return null;
+          typeOffset = currentType.typeOffset;
+          currentType = this.resolveDwarfType(typeOffset);
+        }
+        // Use the full DWARF element size, not the scalar read size (which is
+        // capped at 8 bytes). This also preserves struct/multidimensional stride.
+        if (!currentType || !Number.isSafeInteger(currentType.byteSize) || currentType.byteSize <= 0
+          || !addOffset(index * currentType.byteSize)) return null;
+      }
+      if (!currentType) return null;
+    }
+
+    if (!currentType && sym.size > 8) return null;
+    if (!this.isFastScalarType(currentType)) return null;
+    const size = this.getScalarReadSize(path[2] ? undefined : sym.size, currentType);
+    const typeName = typeOffset ? this.getDwarfTypeName(typeOffset) : currentType?.typeName || currentType?.name || '';
+    const scalar = {
       expression,
-      address: sym.address,
       size,
       typeName,
-      isFloat: this.isFloatType(resolvedType),
-      signed: this.isSignedIntegerType(resolvedType),
-      format: this.fastDataSampleFormat(resolvedType, typeName),
+      isFloat: this.isFloatType(currentType),
+      signed: this.isSignedIntegerType(currentType),
+      format: this.fastDataSampleFormat(currentType, typeName),
     };
+    if (pointerChain.length === 1) {
+      const pointerAddress = pointerChain[0].pointerAddress;
+      return { ...scalar, address: pointerAddress, pointerAddress, pointeeOffset: offset };
+    }
+    if (pointerChain.length > 1) {
+      pointerChain.push({ pointerAddress: 0, offset });
+      return { ...scalar, address: pointerChain[0].pointerAddress, pointerChain };
+    }
+    const address = this.checkedFastSampleAddress(sym.address, offset, size);
+    return address === null ? null : { ...scalar, address };
   }
 
   private fastDataSampleFormat(
@@ -3126,6 +3087,8 @@ case 'readVariableRuntime':
     specs: FastDataSampleSpec[],
     priority: 'watch' | 'timeline' = 'timeline',
   ): Promise<WatchValue[]> {
+    const readStartedAt = performance.now();
+    this.fastSamplingCounts.captures++;
     const rawByIndex: Array<Uint8Array | null> = Array(specs.length).fill(null);
     const resolvedAddresses = specs.map(spec => spec?.address ?? 0);
     const validSpecs = specs.map(spec => {
@@ -3165,117 +3128,95 @@ case 'readVariableRuntime':
       };
     });
 
-    if (this.sessionTarget && specs.length > 0) {
-      const merged = this.mergeFastSampleReads(initialReads
-        .map((read, index) => ({ index, ...read }))
-        .filter(read => validSpecs[read.index]));
-      const result = await this.sessionTarget.readMemoryBatch(
-        merged.map(read => ({ address: read.address, size: read.size })),
-        priority === 'timeline'
-          ? { priority, coalesceKey: 'fast-data-sampling' }
-          : { priority },
-      );
-      if (result.ok && result.data) {
-        this.assignFastSampleBatch(rawByIndex, merged, result.data.reads);
-      }
-    }
-    for (let index = 0; index < specs.length; index++) {
-      if (!validSpecs[index]) continue;
-      if (rawByIndex[index]) continue;
-      const initial = initialReads[index];
-      rawByIndex[index] = await this.targetReadMemory(initial.address, initial.size, priority);
-    }
-
-    for (let index = 0; index < specs.length; index++) {
-      const spec = specs[index];
-      if (!validSpecs[index] || !Array.isArray(spec.pointerChain) || spec.pointerChain.length === 0) continue;
-
-      let currentPointer = 0;
-      let isValid = true;
-      for (let chainIndex = 0; chainIndex < spec.pointerChain.length; chainIndex++) {
-        const step = spec.pointerChain[chainIndex];
-        if (chainIndex === 0) {
-          const pointerBytes = rawByIndex[index];
-          if (!pointerBytes || pointerBytes.length !== 4) {
-            isValid = false;
-            break;
-          }
-          currentPointer = this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0;
-          if (!currentPointer) {
-            isValid = false;
-            break;
-          }
-        } else if (chainIndex < spec.pointerChain.length - 1) {
-          const readAddress = this.checkedFastSampleAddress(currentPointer, step.offset, 4);
-          if (readAddress === null) {
-            isValid = false;
-            break;
-          }
-          const pointerBytes = await this.targetReadMemory(readAddress, 4, priority);
-          if (!pointerBytes || pointerBytes.length !== 4) {
-            isValid = false;
-            break;
-          }
-          currentPointer = this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0;
-          if (!currentPointer) {
-            isValid = false;
-            break;
-          }
-        } else {
-          const finalAddress = this.checkedFastSampleAddress(currentPointer, step.offset, spec.size);
-          if (finalAddress === null) {
-            isValid = false;
-            break;
-          }
-          resolvedAddresses[index] = finalAddress;
-          rawByIndex[index] = await this.targetReadMemory(finalAddress, spec.size, priority);
+    // A capture owns this cache. Pointer bytes are refreshed on the next capture.
+    const captureCache = new Map<string, Uint8Array | null>();
+    const sessionTarget = this.sessionTarget;
+    const sessionGeneration = this.sessionGeneration;
+    const isCurrentCapture = () => this.sessionTarget === sessionTarget && this.sessionGeneration === sessionGeneration;
+    const readRound = async (reads: Array<{ index: number; address: number; size: number }>) => {
+      if (!reads.length || !isCurrentCapture()) return;
+      const missing = reads.filter(read => !captureCache.has(read.address + ':' + read.size));
+      const roundRaw: Array<Uint8Array | null> = Array(specs.length).fill(null);
+      if (sessionTarget && missing.length) {
+        const merged = this.mergeFastSampleReads(missing);
+        this.fastSamplingCounts.batchRequests++;
+        const result = await sessionTarget.readMemoryBatch(
+          merged.map(read => ({ address: read.address, size: read.size })),
+          priority === 'timeline'
+            ? { priority, coalesceKey: 'fast-data-sampling' }
+            : { priority },
+        );
+        if (!isCurrentCapture()) return;
+        if (result.ok && result.data) {
+          this.assignFastSampleBatch(roundRaw, merged, result.data.reads);
+        } else if (result.errorCode === 'RequestCancelled' || result.errorCode === 'NativeOwnerLost') {
+          // Cancellation/owner loss must not launch a second series of reads.
+          for (const read of reads) rawByIndex[read.index] = null;
+          return;
         }
       }
+      for (const read of reads) {
+        if (!isCurrentCapture()) return;
+        const key = read.address + ':' + read.size;
+        if (!captureCache.has(key)) {
+          let raw = roundRaw[read.index];
+          if (!raw) {
+            this.fastSamplingCounts.fallbackReads++;
+            raw = await this.targetReadMemory(read.address, read.size, priority);
+          }
+          if (!isCurrentCapture()) return;
+          captureCache.set(key, raw?.length === read.size ? raw : null);
+        } else {
+          this.fastSamplingCounts.cacheHits++;
+        }
+        rawByIndex[read.index] = captureCache.get(key) ?? null;
+      }
+    };
+    await readRound(initialReads
+      .map((read, index) => ({ index, ...read }))
+      .filter(read => validSpecs[read.index]));
 
-      if (!isValid) {
-        rawByIndex[index] = null;
-      }
-    }
-
-    const indirectReads: Array<{ index: number; address: number; size: number }> = [];
-    for (let index = 0; index < specs.length; index++) {
-      const spec = specs[index];
-      if (!validSpecs[index] || spec.pointerChain || spec.pointerAddress === undefined) continue;
-      const pointerBytes = rawByIndex[index];
-      const pointer = pointerBytes?.length === 4 ? this.readUnsignedLittleEndian(pointerBytes, 4) >>> 0 : 0;
-      if (!pointer || spec.pointeeOffset === undefined) {
-        rawByIndex[index] = null;
-        continue;
-      }
-      const address = this.checkedFastSampleAddress(pointer, spec.pointeeOffset, spec.size);
-      if (address === null) {
-        rawByIndex[index] = null;
-        continue;
-      }
-      resolvedAddresses[index] = address;
+    // Resolve all expressions breadth-first. Shared roots and intermediate
+    // pointers are read once per capture; every layer still uses the owner queue.
+    const chains = specs.map((spec, index) => {
+      if (!validSpecs[index]) return [];
+      if (spec.pointerChain?.length) return spec.pointerChain;
+      return spec.pointerAddress === undefined ? [] : [
+        { pointerAddress: spec.pointerAddress, offset: 0 },
+        { pointerAddress: 0, offset: spec.pointeeOffset! },
+      ];
+    });
+    const pointers = specs.map((_spec, index) => {
+      if (!chains[index].length) return 0;
+      const raw = rawByIndex[index];
       rawByIndex[index] = null;
-      indirectReads.push({ index, address, size: spec.size });
-    }
-
-    if (this.sessionTarget && indirectReads.length > 0) {
-      const merged = this.mergeFastSampleReads(indirectReads);
-      const result = await this.sessionTarget.readMemoryBatch(
-        merged.map(read => ({ address: read.address, size: read.size })),
-        priority === 'timeline'
-          ? { priority, coalesceKey: 'fast-data-sampling' }
-          : { priority },
-      );
-      if (result.ok && result.data) {
-        this.assignFastSampleBatch(rawByIndex, merged, result.data.reads);
-      } else {
-        for (const read of indirectReads) rawByIndex[read.index] = null;
+      return raw?.length === 4 ? this.readUnsignedLittleEndian(raw, 4) >>> 0 : 0;
+    });
+    for (let depth = 1; depth <= FAST_SAMPLE_MAX_POINTER_DEREFERENCES; depth++) {
+      const frontier: Array<{ index: number; address: number; size: number }> = [];
+      for (let index = 0; index < specs.length; index++) {
+        const chain = chains[index];
+        if (!pointers[index] || depth >= chain.length) continue;
+        const final = depth === chain.length - 1;
+        const size = final ? specs[index].size : 4;
+        const address = this.checkedFastSampleAddress(pointers[index], chain[depth].offset, size);
+        rawByIndex[index] = null;
+        if (address === null) { pointers[index] = 0; continue; }
+        if (final) resolvedAddresses[index] = address;
+        frontier.push({ index, address, size });
+      }
+      if (!frontier.length) break;
+      await readRound(frontier);
+      for (const read of frontier) {
+        if (depth === chains[read.index].length - 1) { pointers[read.index] = 0; continue; }
+        const raw = rawByIndex[read.index];
+        pointers[read.index] = raw?.length === 4 ? this.readUnsignedLittleEndian(raw, 4) >>> 0 : 0;
+        rawByIndex[read.index] = null;
       }
     }
-    for (const read of indirectReads) {
-      if (rawByIndex[read.index]) continue;
-      rawByIndex[read.index] = await this.targetReadMemory(read.address, read.size, priority);
-    }
 
+    const formatStartedAt = performance.now();
+    this.fastSamplingReadMs.record(formatStartedAt - readStartedAt);
     const results: WatchValue[] = [];
     for (let index = 0; index < specs.length; index++) {
       const spec = specs[index];
@@ -3321,6 +3262,7 @@ case 'readVariableRuntime':
         typeName: spec.typeName,
       });
     }
+    this.fastSamplingFormatMs.record(performance.now() - formatStartedAt);
     return results;
   }
 

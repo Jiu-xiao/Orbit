@@ -294,6 +294,11 @@ export class DapSession extends EventEmitter {
   private dataSamplingIntervalMs = 0.2;
   private dataSamplingSendIntervalMs = 16;
   private dataSamplingNextSampleMs = 0;
+  private readonly dataSamplingCommitMs = new BoundedMetric(8_192);
+  private readonly dataSamplingCounts = { attempts: 0, gateDeferred: 0, readsCompleted: 0, samplesAccepted: 0, samplesSent: 0 };
+  private dataSamplingSummaryAt = 0;
+  private dataSamplingSummaryAccepted = 0;
+  private dataSamplingSummarySent = 0;
   private readonly highResEpochMs = Date.now();
   private readonly highResStartNs = process.hrtime.bigint();
   private variableHandles = new Map<number, DapVariableHandle | WatchValue[]>();
@@ -344,6 +349,9 @@ export class DapSession extends EventEmitter {
   }
 
   private async queryTargetState(context: string): Promise<OzoneCommandResult> {
+    if (this.isSessionTerminating()) {
+      return { ok: false, error: 'TargetDisconnected: debug session is ending', errorCode: 'TargetDisconnected' };
+    }
     const result = await this.backend.execute({ cmd: 'getTargetState' });
     if (!this.targetConnectionEstablished || this.phase === 'terminating' || this.phase === 'terminated') {
       return result;
@@ -351,9 +359,7 @@ export class DapSession extends EventEmitter {
 
     const hardDisconnect = result.ok
       ? result.data === TargetState.Disconnected
-      : result.errorCode === 'NativeOwnerLost'
-        || result.errorCode === 'TargetOwnerUnavailable'
-        || result.errorCode === 'TargetDisconnected';
+      : this.isOwnerLossErrorCode(result.errorCode);
     const softDisconnect = result.ok
       ? result.data === TargetState.Error
       : result.errorCode === 'JLinkCallFailed'
@@ -753,6 +759,7 @@ export class DapSession extends EventEmitter {
 
   private snapshotTargetReadGateMetrics() {
     return {
+      sampling: { ...this.dataSamplingCounts, commitMs: this.dataSamplingCommitMs.snapshot() },
       queueWaitMs: this.targetReadQueueWaitMetric.snapshot(),
       gateHoldMs: this.targetReadHoldMetric.snapshot(),
       handoffGapMs: this.targetReadHandoffGapMetric.snapshot(),
@@ -1476,7 +1483,9 @@ export class DapSession extends EventEmitter {
       || errorCode === 'NativeOwnerLost'
       || errorCode === 'RttOwnerLost'
       || errorCode === 'TargetOwnerUnavailable'
-      || errorCode === 'TargetDisconnected';
+      || errorCode === 'TargetDisconnected'
+      // The probe can remain on USB while its SWD target stops acknowledging.
+      || errorCode === 'DapAckNoAck';
   }
 
   private logRttFailure(operation: string, result: OzoneCommandResult) {
@@ -4917,7 +4926,8 @@ export class DapSession extends EventEmitter {
     const plan = planResult.data as FastDataSamplePlanItem[];
     const specs = plan.map(item => item.spec).filter((spec): spec is FastDataSampleSpec => !!spec);
     if (specs.length === 0) {
-      this.sendResponse(msg, { ok: false, planned: plan }, false, 'No expressions can use fast data sampling');
+      const details = plan.map(item => `${item.expression}: ${item.error}`).join('; ');
+      this.sendResponse(msg, { ok: false, planned: plan }, false, `No expressions can use fast data sampling: ${details}`);
       return;
     }
 
@@ -5011,12 +5021,17 @@ export class DapSession extends EventEmitter {
 
   private async captureFastDataSample(): Promise<boolean> {
     if (!this.targetRunning) return false;
-    if (!this.beginTargetRead()) return false;
+    this.dataSamplingCounts.attempts++;
+    if (!this.beginTargetRead()) { this.dataSamplingCounts.gateDeferred++; return false; }
+    const specs = this.dataSamplingSpecs;
+    const readEpoch = this.readCancelEpoch;
     try {
-      const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs: this.dataSamplingSpecs });
+      const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs });
+      this.dataSamplingCounts.readsCompleted++;
       // A stopped event can win the race while the batch was in flight. Those
       // bytes are not a post-stop Timeline sample and must not advance the plot.
-      if (!this.targetRunning || !result.ok) return true;
+      if (!this.targetRunning || readEpoch !== this.readCancelEpoch || specs !== this.dataSamplingSpecs || !result.ok) return true;
+      const commitStartedAt = this.nowMs();
       const values = result.data as WatchValue[];
       const timestamp = this.timelineNowMs();
       const gapThresholdMs = Math.max(
@@ -5037,10 +5052,12 @@ export class DapSession extends EventEmitter {
           display: value.display,
           ...(startsNewSegment ? { startsNewSegment: true } : {}),
         });
+        this.dataSamplingCounts.samplesAccepted++;
         this.dataSamplingSeenExpressions.add(value.expression);
         this.dataSamplingLastTimestamp.set(value.expression, timestamp);
         this.dataSamplingLastDisplay.set(value.expression, value.display);
       }
+      this.dataSamplingCommitMs.record(this.nowMs() - commitStartedAt);
       return true;
     } finally {
       this.endTargetRead();
@@ -5058,12 +5075,20 @@ export class DapSession extends EventEmitter {
         currentValue: this.dataSamplingLastDisplay.get(entry.expression) || '',
         data: pending.splice(0),
       });
+      this.dataSamplingCounts.samplesSent += snapshots[snapshots.length - 1].data.length;
     }
     if (snapshots.length > 0) {
       this.sendEvent('ozoneDataSamples', {
         snapshots,
         intervalMs: this.dataSamplingIntervalMs,
       });
+      const now = this.nowMs();
+      if (now - this.dataSamplingSummaryAt >= 1000) {
+        if (this.dataSamplingSummaryAt) log.dap(`[timeline] sampling summary windowMs=${(now - this.dataSamplingSummaryAt).toFixed(1)} accepted=${this.dataSamplingCounts.samplesAccepted - this.dataSamplingSummaryAccepted} sent=${this.dataSamplingCounts.samplesSent - this.dataSamplingSummarySent} totals=${JSON.stringify(this.dataSamplingCounts)}`);
+        this.dataSamplingSummaryAt = now;
+        this.dataSamplingSummaryAccepted = this.dataSamplingCounts.samplesAccepted;
+        this.dataSamplingSummarySent = this.dataSamplingCounts.samplesSent;
+      }
     }
   }
 
