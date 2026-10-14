@@ -46,6 +46,8 @@ import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
 import { CmsisDapTransport, DebugProbe, DebugProbePreference } from './types';
+import { RMLinkTargetChannel } from './rmlink-target-channel';
+import type { CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 
 export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
 export type SessionTargetMode = 'legacy' | 'native' | 'auto';
@@ -60,6 +62,7 @@ export interface TargetChannelInfo {
 }
 
 export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
+  rmlinkDeviceId?: string;
   probe?: DebugProbePreference;
   cmsisDapTransport?: CmsisDapTransport;
   cmsisDapSerial?: string;
@@ -73,6 +76,10 @@ export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
 let nextSessionId = 1;
 
 export interface SessionTargetOwner extends NativeStepExecutor {
+  readonly supportsSubscriptions?: boolean;
+  subscribe?(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig):Promise<{subscription_id:number;capture_id?:number}>;
+  unsubscribe?(id:number):Promise<unknown>;
+  onCapture?(listener:(sample:CaptureSample)=>void):()=>void;
   readonly kind: Exclude<SessionTargetOwnerKind, 'none'>;
   readonly usingNative: boolean;
   detectProbe?(config: SessionTargetConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>>;
@@ -122,10 +129,21 @@ export class SessionTargetSelector {
     private readonly createNative: SessionTargetOwnerFactory,
     private readonly createLegacy: SessionTargetOwnerFactory,
     private readonly createCmsisDap: SessionTargetOwnerFactory = () => new CmsisDapTargetChannel(),
+    private readonly createRMLink: SessionTargetOwnerFactory = () => new RMLinkTargetChannel(),
   ) {}
 
   get ownerKind(): SessionTargetOwnerKind { return this.owner?.kind || 'none'; }
   get usingNative(): boolean { return this.owner?.usingNative === true; }
+  get supportsSubscriptions() { return this.owner?.supportsSubscriptions===true; }
+  subscribe(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig) {
+    if(!this.owner?.subscribe)throw new Error('Selected owner does not support probe subscriptions');
+    return this.owner.subscribe(kind,config);
+  }
+  unsubscribe(id:number) { return this.owner?.unsubscribe?.(id) || Promise.resolve(); }
+  onCapture(listener:(sample:CaptureSample)=>void) {
+    if(!this.owner?.onCapture)throw new Error('Selected owner does not support capture events');
+    return this.owner.onCapture(listener);
+  }
   get flashTarget(): FlashTargetDefinition | null { return this.owner?.flashTarget ?? null; }
 
   async resolveProbe(config: SessionTargetConnectConfig): Promise<CppJLinkResult<{ probe: DebugProbe }>> {
@@ -194,6 +212,11 @@ export class SessionTargetSelector {
       );
     }
 
+    if (config.rmlinkDeviceId) {
+      const owner=this.createRMLink();const result=await owner.connect(config);
+      if(result.ok)this.owner=owner;else await owner.dispose(false);
+      return result;
+    }
     if (config.probe === 'cmsis-dap') {
       log.dll(`target-owner session=${this.sessionId} select probe=cmsis-dap owner=none command=connect targetConnected=false`);
       const cmsisDap = this.createCmsisDap();

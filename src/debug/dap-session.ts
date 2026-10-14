@@ -283,6 +283,13 @@ export class DapSession extends EventEmitter {
   /** Last ELF this session actually programmed. Restart compares against it. */
   private _lastFlashedFirmware: FlashedFirmwareIdentity | undefined;
   private dataSamplingActive = false;
+  private probeSamplingStop:(()=>Promise<void>)|null=null;
+  private probeSamplingCleanup:Promise<void>=Promise.resolve();
+  private probeSamplingGeneration=0;
+  private probeWatchStop:(()=>Promise<void>)|null=null;
+  private probeWatchKey='';
+  private probeWatchStarting:Promise<void>|null=null;
+  private probeWatchGeneration=0;
   private dataSamplingTimer: NodeJS.Immediate | null = null;
   private dataSamplingSendTimer: NodeJS.Timeout | null = null;
   private dataSamplingEntries: DapSamplingEntry[] = [];
@@ -1989,8 +1996,10 @@ export class DapSession extends EventEmitter {
       }
 
       this.phase = 'connecting';
+      this.probeWatchGeneration++;this.probeWatchKey='';this.probeWatchStop=null;
       const connectResult = await this.backend.execute({
         cmd: 'connect', config: {
+          rmlinkDeviceId: targetConfig.rmlinkDeviceId,
           device,
           interface: interface_,
           speedKHz,
@@ -4885,6 +4894,41 @@ export class DapSession extends EventEmitter {
   private async handleWatchEvaluate(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
     const expressions = this.normalizeWatchExpressions(args.expressions);
+    if(this.backend.supportsProbeSubscriptions && !this.isSessionTerminating()) {
+      const key=JSON.stringify(expressions);
+      if(key!==this.probeWatchKey) {
+        try {
+        while(this.probeWatchStarting)await this.probeWatchStarting;
+        if(key!==this.probeWatchKey) {
+        const starting=(async()=>{
+          const generation=++this.probeWatchGeneration;
+          if(this.probeWatchStop){await this.probeWatchStop();this.probeWatchStop=null;}
+          const plan=await this.backend.execute({cmd:'prepareFastDataSampling',expressions});
+          if(!plan.ok)throw new Error(plan.error || 'RMLink Watch planning failed');
+          if(generation!==this.probeWatchGeneration || this.isSessionTerminating())return;
+          const specs=(plan.data as FastDataSamplePlanItem[] || []).map(p=>p.spec).filter((s):s is FastDataSampleSpec=>!!s);
+          if(specs.length) this.probeWatchStop=await this.backend.subscribeProbeSamples('memory_snapshot',specs,100000,sample=>{
+            if(generation!==this.probeWatchGeneration || this.isSessionTerminating())return;
+            specs.forEach((spec,i)=>{
+              if(!sample.values || !(sample.validBitmap&(1<<i))) {
+                this.runtimeWatchCache.set(spec.expression,{expression:spec.expression,value:'Unavailable',display:'Unavailable',hex:'',error:'RMLink field invalid',errorCode:'RMLinkInvalidField'});
+                return;
+              }
+              const raw=sample.values[i],buffer=Buffer.alloc(4);buffer.writeUInt32LE(raw);
+              const value=spec.isFloat?buffer.readFloatLE():spec.signed?
+                spec.size===1?buffer.readInt8():spec.size===2?buffer.readInt16LE():buffer.readInt32LE():raw;
+              this.cacheRuntimeWatchValue(spec.expression,{expression:spec.expression,value,display:String(value),hex:'0x'+raw.toString(16),typeName:spec.typeName});
+            });
+          });
+          this.probeWatchKey=key;
+        })();
+        this.probeWatchStarting=starting;
+        try{await starting;}finally{if(this.probeWatchStarting===starting)this.probeWatchStarting=null;}
+        }
+        }catch(error){this.sendResponse(msg,undefined,false,String(error));return;}
+      }
+      this.sendResponse(msg,{results:expressions.map(expr=>this.cachedOrRunningWatchValue(expr))});return;
+    }
     if (this.shouldDeferTargetRead()) {
       this.sendResponse(msg, { results: expressions.map(expr => this.cachedOrRunningWatchValue(expr)) });
       return;
@@ -4950,7 +4994,34 @@ export class DapSession extends EventEmitter {
       + ` rejected=${rejected.join(',') || 'none'} sampleMs=${this.dataSamplingIntervalMs} sendMs=${this.dataSamplingSendIntervalMs}`,
     );
     this.startDataSamplingFlushTimer();
-    this.scheduleDataSamplingLoop();
+    if(this.backend.supportsProbeSubscriptions) {
+      await this.probeSamplingCleanup;
+      const generation=this.probeSamplingGeneration;
+      let offset:number|undefined,lastSeq:number|undefined;
+      try {
+        this.probeSamplingStop=await this.backend.subscribeProbeSamples('memory_series',specs,
+          Math.max(200,Math.round(this.dataSamplingIntervalMs*1000)),sample=>{
+          if(generation!==this.probeSamplingGeneration || !this.dataSamplingActive || !this.targetRunning || !sample.values)return;
+          const probeMs=Number(sample.timestampUs)/1000;
+          offset??=this.nowMs()-probeMs;
+          const timestamp=this.timelineNowMs(probeMs+offset);
+          const gap=lastSeq!==undefined && sample.sequence!==((lastSeq+1)>>>0);
+          lastSeq=sample.sequence;
+          specs.forEach((spec,i)=>{
+            if(!(sample.validBitmap&(1<<i)))return;
+            const raw=sample.values![i],bytes=Buffer.alloc(4);bytes.writeUInt32LE(raw);
+            const value=spec.isFloat?bytes.readFloatLE():spec.signed?
+              spec.size===1?bytes.readInt8():spec.size===2?bytes.readInt16LE():bytes.readInt32LE():raw;
+            if(!Number.isFinite(value))return;
+            const pending=this.dataSamplingPending.get(spec.expression);if(!pending)return;
+            const display=String(value);
+            pending.push({timestamp,value,display,...(gap || !this.dataSamplingSeenExpressions.has(spec.expression)?{startsNewSegment:true}:{})});
+            this.dataSamplingSeenExpressions.add(spec.expression);this.dataSamplingLastDisplay.set(spec.expression,display);
+            this.dataSamplingCounts.samplesAccepted++;
+          });
+        });
+      }catch(error){this.stopDataSampling();this.sendResponse(msg,undefined,false,String(error));return;}
+    }else this.scheduleDataSamplingLoop();
     this.sendResponse(msg, {
       ok: true,
       planned: plan,
@@ -4961,6 +5032,7 @@ export class DapSession extends EventEmitter {
 
   private async handleDataSamplingStop(msg: DebugProtocolMessage) {
     this.stopDataSampling();
+    await this.probeSamplingCleanup;
     const performanceResult = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
     this.sendResponse(msg, {
       ok: true,
@@ -5094,6 +5166,11 @@ export class DapSession extends EventEmitter {
 
   private stopDataSampling() {
     this.dataSamplingActive = false;
+    this.probeSamplingGeneration++;
+    if(this.probeSamplingStop) {
+      const stop=this.probeSamplingStop;this.probeSamplingStop=null;
+      this.probeSamplingCleanup=this.probeSamplingCleanup.then(stop).catch(error=>log.dap(`RMLink subscription cleanup: ${String(error)}`));
+    }
     if (this.dataSamplingTimer) {
       clearImmediate(this.dataSamplingTimer);
       this.dataSamplingTimer = null;

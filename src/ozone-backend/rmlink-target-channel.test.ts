@@ -1,0 +1,85 @@
+import { describe,it,expect } from 'vitest';
+import { RMLinkTargetChannel } from './rmlink-target-channel';
+import { SessionTargetSelector } from './session-target-channel';
+import type { RMLinkClient } from '../../clients/rmlink/rmlink-client.mjs';
+import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+
+class ClientModel {
+  opened=0;closed=0;calls:string[]=[];failed=false;rejectOnce=false;
+  images:Array<{data:Buffer;address:number}>=[];
+  async init() {}
+  async open() {this.opened++;}
+  async close() {this.closed++;}
+  async target(command:string) {
+    this.calls.push(command);if(this.failed)throw new Error('owner lost');
+    if(this.rejectOnce){this.rejectOnce=false;throw Object.assign(new Error('invalid register'),{httpStatus:400,errorCode:'InvalidRequest'});}
+    if(command==='read_memory')return {data:'78563412'};
+    if(command==='state')return {state:'Running'};
+    if(command==='read_register')return {value:0x08000100};
+    return {};
+  }
+  async subscribe() {return {subscription_id:3};}
+  async unsubscribe() {}
+  async flashImage(data:Uint8Array,address:number) {this.images.push({data:Buffer.from(data),address});return {verified:true};}
+  async *stream({signal}:{signal:AbortSignal}) {
+    yield {sample:{subscriptionId:3,kind:3,captureId:1,revision:1,sequence:0,timestampUs:1n,durationUs:0,validBitmap:0,flags:0,channel:0,byteSequence:0n,data:Buffer.from('abc')}};
+    await new Promise<void>(resolve=>signal.addEventListener('abort',()=>resolve(),{once:true}));
+  }
+}
+describe('RMLink public-service owner',()=>{
+  it('selects exactly one service owner and never constructs a competing probe',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    const forbidden=()=>{throw new Error('competing probe');};
+    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    expect((await selector.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'})).ok).toBe(true);
+    expect((await selector.readMemory(0x20000000,4)).data?.bytes).toEqual(Buffer.from('78563412','hex'));
+    expect(model.opened).toBe(1);await selector.dispose();expect(model.closed).toBe(1);
+  });
+  it('RTT reads consume the subscription cache without target polling',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+    expect((await owner.startRtt(0x20000400)).ok).toBe(true);
+    await new Promise(resolve=>setImmediate(resolve));
+    expect((await owner.readRtt(0,2)).data?.bytes.toString()).toBe('ab');
+    expect((await owner.readRtt(0,2)).data?.bytes.toString()).toBe('c');
+    expect(model.calls).toEqual(['connect']);await owner.dispose();
+  });
+  it('owner loss terminates access and source stepping is explicit',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+    expect((await owner.stepOut()).errorCode).toBe('UnsupportedCapability');
+    expect((await owner.stepIntoInstruction()).data?.classification).toBe('instruction');
+    model.failed=true;expect((await owner.halt()).errorCode).toBe('NativeOwnerLost');
+    expect(owner.usingNative).toBe(false);await owner.dispose();
+  });
+  it('a rejected command keeps the existing owner available for the next valid command',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32F103C8',speedKHz:0,rmlinkDeviceId:'50787d15a924'});
+    model.rejectOnce=true;expect((await owner.readRegister(19)).errorCode).toBe('InvalidRequest');
+    expect(owner.usingNative).toBe(true);expect((await owner.halt()).ok).toBe(true);
+    await owner.dispose();
+  });
+  it('ELF Flash uses physical load addresses and page padding through the same public client',async()=>{
+    const directory=await mkdtemp(join(tmpdir(),'rmlink-elf-'));
+    const elf=Buffer.alloc(0x104);elf.set([0x7f,0x45,0x4c,0x46,1,1,1]);
+    elf.writeUInt16LE(2,16);elf.writeUInt16LE(40,18);elf.writeUInt32LE(1,20);
+    elf.writeUInt32LE(0x34,28);elf.writeUInt16LE(32,42);elf.writeUInt16LE(1,44);
+    // .data VMA in RAM, LMA in Flash. The ELF parser must select the latter.
+    for(const [offset,value] of [[0,1],[4,0x100],[8,0x20000000],[12,0x08000104],[16,4],[20,4],[24,6],[28,4]])elf.writeUInt32LE(value,0x34+offset);
+    elf.set([1,2,3,4],0x100);const path=join(directory,'fixture.elf');await writeFile(path,elf);
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    try {
+      await owner.connect({device:'STM32F103C8',speedKHz:0,rmlinkDeviceId:'50787d15a924'});
+      expect((await owner.flash(path,'STM32F103C8')).ok).toBe(true);
+      expect(model.opened).toBe(1);expect(model.images).toHaveLength(1);
+      expect(model.images[0].address).toBe(0x08000000);expect(model.images[0].data.length).toBe(1024);
+      expect([...model.images[0].data.subarray(0x104,0x108)]).toEqual([1,2,3,4]);expect(model.images[0].data[0]).toBe(255);
+      const abort=new AbortController();abort.abort();
+      expect((await owner.flash(path,'STM32F103C8',{signal:abort.signal})).errorCode).toBe('RequestCancelled');
+      expect((await owner.flash(path,'STM32F407VE')).errorCode).toBe('TargetMismatch');
+      expect(model.images).toHaveLength(1);
+    }finally{await owner.dispose();await rm(directory,{recursive:true,force:true});}
+  });
+});

@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../utils/logger';
 import { BoundedMetric } from '../utils/bounded-metric';
+import type { CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import {
   CppJLinkResult,
   NativeStepExecutor,
@@ -125,6 +126,29 @@ export class OzoneBackend {
 
   get currentState(): TargetState {
     return this.state;
+  }
+
+  get supportsProbeSubscriptions() { return this.sessionTarget?.supportsSubscriptions===true; }
+  async subscribeProbeSamples(kind:'memory_series'|'memory_snapshot',specs:FastDataSampleSpec[],periodUs:number,
+      onSample:(sample:CaptureSample)=>void):Promise<()=>Promise<void>> {
+    const target=this.sessionTarget;
+    if(!target?.subscribe || !target.onCapture)throw new Error('Probe subscriptions unavailable');
+    const fields:NonNullable<SubscriptionConfig['fields']>=specs.map(spec=>{
+      if(![1,2,4].includes(spec.size))throw new Error('RMLink supports 8/16/32-bit scalar fields');
+      if(spec.pointerChain?.length) {
+        return {address:spec.pointerChain[0].pointerAddress,offsets:spec.pointerChain.slice(1).map(s=>s.offset),byte_length:spec.size as 1|2|4};
+      }
+      return {address:spec.pointerAddress??spec.address,
+        offsets:spec.pointerAddress===undefined?[]:[spec.pointeeOffset??0],byte_length:spec.size as 1|2|4};
+    });
+    const expectedKind=kind==='memory_series'?1:2;
+    let expectedCapture:number|undefined;
+    const detach=target.onCapture(sample=>{if(sample.kind===expectedKind && sample.captureId===expectedCapture)onSample(sample);});
+    try {
+      const handle=await target.subscribe(kind,{fields,period_us:periodUs});
+      expectedCapture=handle.capture_id;
+      return async()=>{detach();await target.unsubscribe?.(handle.subscription_id);};
+    }catch(error){detach();throw error;}
   }
 
   get hasTargetConnection(): boolean {

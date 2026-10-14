@@ -4,6 +4,7 @@ import {
 } from '../ozone-backend/types';
 
 export interface NormalizedDapLaunchConfig {
+  rmlinkDeviceId?: string;
   probe: DebugProbePreference;
   cmsisDapTransport: CmsisDapTransport;
   cmsisDapSerial?: string;
@@ -19,11 +20,11 @@ export class DapLaunchConfigError extends Error {
   readonly errorCode = 'InvalidConfiguration' as const;
 
   constructor(
-    readonly field: 'probe' | 'cmsisDapTransport',
+    readonly field: 'probe' | 'cmsisDapTransport' | 'rmlinkDeviceId',
     value: unknown,
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
-    const allowed = field === 'probe'
+    const allowed = field === 'rmlinkDeviceId' ? 'a 12-digit RMLink device ID' : field === 'probe'
       ? 'auto, jlink, or cmsis-dap'
       : 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb';
     super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
@@ -52,8 +53,15 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     cmsisDapTransport: args.cmsisDapTransport === undefined ? 'auto' : args.cmsisDapTransport,
     flashBeforeDebug: args.flashBeforeDebug !== false,
   };
+  if(args.rmlinkDeviceId!==undefined) {
+    if(typeof args.rmlinkDeviceId!=='string' || !/^[0-9a-fA-F]{12}$/.test(args.rmlinkDeviceId))throw new DapLaunchConfigError('rmlinkDeviceId',args.rmlinkDeviceId);
+    if(args.probe==='jlink')throw new DapLaunchConfigError('probe',args.probe);
+    config.rmlinkDeviceId=args.rmlinkDeviceId.toLowerCase();config.probe='cmsis-dap';
+    if(args.flashBeforeDebug===undefined)config.flashBeforeDebug=false;
+    config.runToEntryPoint=false;
+  }
 
-  if (config.probe === 'cmsis-dap') {
+  if (config.probe === 'cmsis-dap' && !config.rmlinkDeviceId) {
     const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
     config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
   }
@@ -70,6 +78,7 @@ export function applyNormalizedDapLaunchConfig(
   targetConfig: NormalizedDapLaunchConfig,
 ): void {
   config.probe = targetConfig.probe;
+  config.rmlinkDeviceId=targetConfig.rmlinkDeviceId;
   config.cmsisDapTransport = targetConfig.cmsisDapTransport;
   config.cmsisDapSerial = targetConfig.cmsisDapSerial;
   config.cmsisDapVid = targetConfig.cmsisDapVid;

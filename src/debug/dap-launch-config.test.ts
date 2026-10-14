@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 describe('DAP launch probe configuration', () => {
+  it('selects the public RMLink owner explicitly without automatic flash',()=>{
+    expect(normalizeDapLaunchConfig({rmlinkDeviceId:'50787D15A924'})).toMatchObject({
+      rmlinkDeviceId:'50787d15a924',probe:'cmsis-dap',flashBeforeDebug:false,runToEntryPoint:false,
+    });
+    expect(()=>normalizeDapLaunchConfig({rmlinkDeviceId:'bad'})).toThrow('rmlinkDeviceId');
+    expect(()=>normalizeDapLaunchConfig({rmlinkDeviceId:'50787d15a924',probe:'jlink'})).toThrow();
+  });
   it('defaults to deterministic auto probe discovery and enables flashing', () => {
     expect(normalizeDapLaunchConfig({})).toEqual({
       probe: 'auto',

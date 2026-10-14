@@ -373,6 +373,11 @@
                 ],
                 "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
                 "default": "auto"
+              },
+              "rmlinkDeviceId": {
+                "type": "string",
+                "description": "Experimental RMLink connection component: paired 12-digit device ID. Enhanced target validation is pending.",
+                "pattern": "^[0-9a-fA-F]{12}$"
               }
             }
           }

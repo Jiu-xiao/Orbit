@@ -3,6 +3,7 @@ export type DebugProbePreference = DebugProbe | 'auto';
 export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb';
 
 export interface DebugProbeLaunchConfig {
+  rmlinkDeviceId?: string;
   probe?: DebugProbePreference;
   cmsisDapTransport?: CmsisDapTransport;
   cmsisDapSerial?: string;
