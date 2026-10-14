@@ -20,10 +20,11 @@ class ClientModel {
     if(command==='read_register')return {value:0x08000100};
     return {};
   }
-  async subscribe() {return {subscription_id:3};}
+  async subscribe() {return {subscription_id:3,capture_id:1};}
   async unsubscribe() {}
   async flashImage(data:Uint8Array,address:number) {this.images.push({data:Buffer.from(data),address});return {verified:true};}
   async *stream({signal}:{signal:AbortSignal}) {
+    yield {sample:{subscriptionId:3,kind:3,captureId:0,revision:1,sequence:0,timestampUs:0n,durationUs:0,validBitmap:0,flags:0,channel:0,byteSequence:0n,data:Buffer.from('old')}};
     yield {sample:{subscriptionId:3,kind:3,captureId:1,revision:1,sequence:0,timestampUs:1n,durationUs:0,validBitmap:0,flags:0,channel:0,byteSequence:0n,data:Buffer.from('abc')}};
     await new Promise<void>(resolve=>signal.addEventListener('abort',()=>resolve(),{once:true}));
   }

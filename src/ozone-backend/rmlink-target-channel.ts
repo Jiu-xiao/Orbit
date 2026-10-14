@@ -1,5 +1,5 @@
 /** Experimental RMLink owner. Uses the public SDK; target execution stays in Connector.
- * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.0 (Apache-2.0).
+ * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.1 (Apache-2.0).
  */
 import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
@@ -21,6 +21,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   private readonly listeners = new Set<(sample: CaptureSample) => void>();
   private readonly rttData = new Map<number, Buffer>();
   private readonly rttIds = new Set<number>();
+  private readonly activeCaptures=new Map<number,number>();
   private rttCacheDropped=0;
   constructor(client = new RMLinkClient()) { this.client = client; }
   get usingNative() { return this.connected; }
@@ -71,11 +72,13 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   async subscribe(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig) {
     if(!this.connected)throw new Error('RMLink owner unavailable');
     const r=await this.client.subscribe(kind,config);
+    this.activeCaptures.set(r.subscription_id,r.capture_id);
     if(!this.streamTask) {
       this.streamAbort=new AbortController();
       this.streamTask=(async()=>{
         try { for await(const record of this.client.stream({signal:this.streamAbort!.signal})) {
           const sample=record.sample;
+          if(this.activeCaptures.get(sample.subscriptionId)!==sample.captureId)continue;
           if(sample.kind===3 && sample.data) {
             const channel=sample.channel || 0, previous=this.rttData.get(channel) || Buffer.alloc(0);
             const combined=Buffer.concat([previous,Buffer.from(sample.data)]);
@@ -91,7 +94,9 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     return r;
   }
   onCapture(listener:(sample:CaptureSample)=>void) { this.listeners.add(listener);return ()=>this.listeners.delete(listener); }
-  unsubscribe(id:number) { return this.client.unsubscribe(id); }
+  async unsubscribe(id:number) {
+    await this.client.unsubscribe(id);this.activeCaptures.delete(id);
+  }
   async startRtt(controlBlockAddress?:number) {
     if(controlBlockAddress===undefined)return this.failure('RTT control block address required','InvalidConfiguration');
     try {const r=await this.subscribe('rtt_stream',{control_block_address:controlBlockAddress});this.rttIds.add(r.subscription_id);return this.success({});}
@@ -116,6 +121,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
       try {
         const result=await this.scheduler.schedule(()=>this.client.flashImage(image,begin,options.signal),{priority:'control'});
         this.breakpoints.clear();this.rttIds.clear();this.rttData.clear();
+        this.activeCaptures.clear();
         return this.success({success:true,message:'RMLink service programmed and independently verified the image',
           reports:[],erasedSectors:target.sectors.filter(s=>s.address>=begin && s.address<end),target,diagnostics:result});
       }finally{options.signal?.removeEventListener('abort',cancel);}
@@ -146,6 +152,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     this.streamAbort?.abort();if(this.streamTask)await this.streamTask;
     await this.client.close().catch(()=>{});this.connected=false;this.scheduler.dispose();
     this.listeners.clear();this.rttData.clear();
+    this.activeCaptures.clear();
   }
   getPerformanceDiagnostics() { return {transport:'rmlink-service',boardSubscriptions:true,rttCacheDroppedBytes:this.rttCacheDropped}; }
   getSchedulerSnapshot() { return {...this.scheduler.snapshot()}; }
