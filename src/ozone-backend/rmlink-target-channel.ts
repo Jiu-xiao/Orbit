@@ -1,5 +1,5 @@
 /** Experimental RMLink owner. Uses the public SDK; target execution stays in Connector.
- * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.1 (Apache-2.0).
+ * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.2 (Apache-2.0).
  */
 import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
