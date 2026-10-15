@@ -4122,6 +4122,10 @@ case 'readVariableRuntime':
     if (info.kind === 'array') {
       const elemName = this.formatDwarfTypeName(info.typeOffset, visited);
       const suffix = info.arrayCount && info.arrayCount > 0 ? `[${info.arrayCount}]` : '[]';
+      if(this.dwarfInfo.typeDefs.get(info.typeOffset||'')?.kind==='array') {
+        const bracket=elemName.indexOf('[');
+        if(bracket>=0)return elemName.slice(0,bracket)+suffix+elemName.slice(bracket);
+      }
       return `${elemName || 'unknown'}${suffix}`;
     }
 
