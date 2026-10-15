@@ -9,6 +9,7 @@ import {join} from 'node:path';
 class ClientModel {
   opened=0;closed=0;calls:string[]=[];failed=false;rejectOnce=false;
   images:Array<{data:Buffer;address:number}>=[];
+  streamOpens=0;flashError:Error|null=null;flashSignal:AbortSignal|undefined;
   async init() {}
   async open() {this.opened++;}
   async close() {this.closed++;}
@@ -24,8 +25,13 @@ class ClientModel {
   }
   async subscribe() {return {subscription_id:3,capture_id:1};}
   async unsubscribe() {}
-  async flashImage(data:Uint8Array,address:number) {this.images.push({data:Buffer.from(data),address});return {verified:true};}
+  async flashImage(data:Uint8Array,address:number,signal?:AbortSignal) {
+    this.flashSignal=signal;this.images.push({data:Buffer.from(data),address});
+    if(this.flashError)throw this.flashError;
+    return {verified:true,verification:'probe_full_compare',host_verified:false,probe_verified:true};
+  }
   async *stream({signal}:{signal:AbortSignal}) {
+    this.streamOpens++;
     yield {sample:{subscriptionId:3,kind:3,captureId:0,revision:1,sequence:0,timestampUs:0n,durationUs:0,validBitmap:0,flags:0,channel:0,byteSequence:0n,data:Buffer.from('old')}};
     yield {sample:{subscriptionId:3,kind:3,captureId:1,revision:1,sequence:0,timestampUs:1n,durationUs:0,validBitmap:0,flags:0,channel:0,byteSequence:0n,data:Buffer.from('abc')}};
     await new Promise<void>(resolve=>signal.addEventListener('abort',()=>resolve(),{once:true}));
@@ -84,7 +90,15 @@ describe('RMLink public-service owner',()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     try {
       await owner.connect({device:'STM32F103C8',speedKHz:0,rmlinkDeviceId:'50787d15a924'});
-      expect((await owner.flash(path,'STM32F103C8')).ok).toBe(true);
+      await owner.startRtt(0x20000400);await new Promise(resolve=>setImmediate(resolve));
+      expect(model.streamOpens).toBe(1);
+      const result=await owner.flash(path,'STM32F103C8');
+      expect(result.ok).toBe(true);
+      expect(result.data?.diagnostics?.verification).toBe('probe_full_compare');
+      expect(owner.usingNative).toBe(true);
+      await owner.startRtt(0x20000400);await new Promise(resolve=>setImmediate(resolve));
+      expect(model.streamOpens).toBe(2);
+      expect((await owner.readRtt(0,10)).data?.bytes.toString()).toBe('abc');
       expect(model.opened).toBe(1);expect(model.images).toHaveLength(1);
       expect(model.images[0].address).toBe(0x08000000);expect(model.images[0].data.length).toBe(1024);
       expect([...model.images[0].data.subarray(0x104,0x108)]).toEqual([1,2,3,4]);expect(model.images[0].data[0]).toBe(255);
@@ -92,6 +106,11 @@ describe('RMLink public-service owner',()=>{
       expect((await owner.flash(path,'STM32F103C8',{signal:abort.signal})).errorCode).toBe('RequestCancelled');
       expect((await owner.flash(path,'STM32F407VE')).errorCode).toBe('TargetMismatch');
       expect(model.images).toHaveLength(1);
+      model.flashError=Object.assign(new Error('Board cancelled and halted'),{errorCode:'FlashCancelled',httpStatus:409});
+      const cancellation=new AbortController();
+      expect((await owner.flash(path,'STM32F103C8',{signal:cancellation.signal})).errorCode).toBe('RequestCancelled');
+      expect(model.flashSignal).toBe(cancellation.signal);
+      expect(owner.usingNative).toBe(true);
     }finally{await owner.dispose();await rm(directory,{recursive:true,force:true});}
   });
 });

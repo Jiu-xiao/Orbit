@@ -1,5 +1,5 @@
 /** Experimental RMLink owner. Uses the public SDK; target execution stays in Connector.
- * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.3 (Apache-2.0).
+ * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.8 (Apache-2.0).
  */
 import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
@@ -23,6 +23,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   private readonly rttIds = new Set<number>();
   private readonly activeCaptures=new Map<number,number>();
   private rttCacheDropped=0;
+  private flashing=false;
   constructor(client = new RMLinkClient()) { this.client = client; }
   get usingNative() { return this.connected; }
   async connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>> {
@@ -77,13 +78,17 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   async clearBreakpoint(id:number) { const r=await this.control('clear_breakpoint',{id});if(r.ok)this.breakpoints.delete(id);return r; }
   async clearAllBreakpoints() { for(const id of this.breakpoints){const r=await this.clearBreakpoint(id);if(!r.ok)return r;}return this.success({}); }
   async subscribe(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig) {
+    return this.scheduler.schedule(()=>this.subscribeSerial(kind,config),{priority:'control'});
+  }
+  private async subscribeSerial(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig) {
     if(!this.connected)throw new Error('RMLink owner unavailable');
+    if(this.flashing)throw new Error('Flash operation owns the target');
     const r=await this.client.subscribe(kind,config);
     this.activeCaptures.set(r.subscription_id,r.capture_id);
     if(!this.streamTask) {
-      this.streamAbort=new AbortController();
+      const abort=new AbortController();this.streamAbort=abort;
       this.streamTask=(async()=>{
-        try { for await(const record of this.client.stream({signal:this.streamAbort!.signal})) {
+        try { for await(const record of this.client.stream({signal:abort.signal})) {
           const sample=record.sample;
           if(this.activeCaptures.get(sample.subscriptionId)!==sample.captureId)continue;
           if(sample.kind===3 && sample.data) {
@@ -95,14 +100,22 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
           for(const listener of this.listeners) {
             try{listener(sample);}catch{this.listeners.delete(listener);}
           }
-        } } catch(error) { if(!this.streamAbort?.signal.aborted)this.connected=false; }
+        } } catch(error) { if(!abort.signal.aborted)this.connected=false; }
       })();
     }
     return r;
   }
   onCapture(listener:(sample:CaptureSample)=>void) { this.listeners.add(listener);return ()=>this.listeners.delete(listener); }
   async unsubscribe(id:number) {
-    await this.client.unsubscribe(id);this.activeCaptures.delete(id);
+    await this.scheduler.schedule(async()=>{
+      await this.client.unsubscribe(id);this.activeCaptures.delete(id);
+      if(!this.activeCaptures.size)await this.stopCaptureStream();
+    },{priority:'control'});
+  }
+  private async stopCaptureStream() {
+    const task=this.streamTask;this.streamAbort?.abort();
+    if(task)await task;
+    this.streamTask=null;this.streamAbort=null;
   }
   async startRtt(controlBlockAddress?:number) {
     if(controlBlockAddress===undefined)return this.failure('RTT control block address required','InvalidConfiguration');
@@ -113,6 +126,8 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   async readRtt(channel:number,size:number) { const data=this.rttData.get(channel)||Buffer.alloc(0);const bytes=data.subarray(0,size);this.rttData.set(channel,data.subarray(bytes.length));return this.success({bytes}); }
   async flash(elfPath:string,device:string,options:CmsisDapFlashOptions={}):Promise<CppJLinkResult<CmsisDapFlashResult>> {
     if(!this.connected)return this.failure('RMLink owner unavailable','NativeOwnerLost');
+    if(this.flashing)return this.failure('Flash operation already running','RequestBusy');
+    this.flashing=true;
     try {
       const target=resolveFlashTarget(device);
       if(!target || target.algorithm!=='stm32f103c8')return this.failure('RMLink enhanced Flash supports registered F103C8 only','TargetMismatch');
@@ -123,16 +138,26 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
       const begin=Math.floor(Math.min(...segments.map(s=>s.loadAddress))/1024)*1024;
       const end=Math.ceil(Math.max(...segments.map(s=>s.loadAddress+s.fileSize))/1024)*1024;
       const image=Buffer.alloc(end-begin,0xff);for(const segment of segments)image.set(segment.bytes,segment.loadAddress-begin);
-      const cancel=()=>{void this.client.request('POST',`/sessions/${this.client.session}/flash`,{action:'cancel'}).catch(()=>{});};
-      options.signal?.addEventListener('abort',cancel,{once:true});
-      try {
-        const result=await this.scheduler.schedule(()=>this.client.flashImage(image,begin,options.signal),{priority:'control'});
+      const result=await this.scheduler.schedule(async()=>{
+        try {return await this.client.flashImage(image,begin,options.signal);}
+        finally {
+          // COMMIT stops board subscriptions. End the corresponding local
+          // generation too, so subscriptions after Flash open a fresh stream.
+          for(const id of this.activeCaptures.keys())await this.client.unsubscribe(id).catch(()=>{});
+          await this.stopCaptureStream();this.activeCaptures.clear();
+          this.rttIds.clear();this.rttData.clear();
+        }
+      },{priority:'control'});
+        if(result.verified!==true)throw new Error('Flash did not report a complete image verification');
         this.breakpoints.clear();this.rttIds.clear();this.rttData.clear();
         this.activeCaptures.clear();
-        return this.success({success:true,message:'RMLink service programmed and independently verified the image',
+        return this.success({success:true,message:'RMLink service programmed and fully verified the image',
           reports:[],erasedSectors:target.sectors.filter(s=>s.address>=begin && s.address<end),target,diagnostics:result});
-      }finally{options.signal?.removeEventListener('abort',cancel);}
-    }catch(error){return this.failure(String(error),'OutcomeUnknown');}
+    }catch(error){
+      const failure=error as {name?:string;errorCode?:string;ownerLost?:boolean};
+      if(failure.ownerLost)this.connected=false;
+      return this.failure(String(error),failure.errorCode==='FlashCancelled' || failure.name==='AbortError'?'RequestCancelled':failure.ownerLost?'NativeOwnerLost':'OutcomeUnknown');
+    }finally{this.flashing=false;}
   }
   async stepIntoInstruction():Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {
     const begin=performance.now(),before=await this.readRegister(15);
@@ -156,7 +181,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   async stepOut():Promise<CppJLinkResult<NativeStepOutDiagnostics>> { return this.failure('Source stepping is pending'); }
   async disconnect() { await this.dispose();return this.success({}); }
   async dispose() {
-    this.streamAbort?.abort();if(this.streamTask)await this.streamTask;
+    await this.stopCaptureStream();
     await this.client.close().catch(()=>{});this.connected=false;this.scheduler.dispose();
     this.listeners.clear();this.rttData.clear();
     this.activeCaptures.clear();
