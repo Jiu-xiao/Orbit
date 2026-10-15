@@ -1,5 +1,5 @@
 /** Experimental RMLink owner. Uses the public SDK; target execution stays in Connector.
- * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.2 (Apache-2.0).
+ * SDK source in clients/rmlink is vendored from @rmlink/client 0.2.3 (Apache-2.0).
  */
 import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
@@ -39,7 +39,14 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   private failure<T>(message:string,errorCode='UnsupportedCapability'):CppJLinkResult<T> { return {ok:false,message,errorCode,targetState:'Error',elapsedMs:0}; }
   private async control<T>(command:string,params:Record<string,unknown>={}):Promise<CppJLinkResult<T>> {
     if(!this.connected) return this.failure('RMLink owner unavailable','NativeOwnerLost');
-    try { return await this.scheduler.schedule(async()=>this.success(await this.client.target<T>(command,params)),{priority:'control'}); }
+    try { return await this.scheduler.schedule(async()=>{
+      const data=await this.client.target<T>(command,params);
+      const state=data && typeof data==='object' ? (data as {state?:unknown;dhcsr?:unknown}) : {};
+      const result=this.success(data);
+      if(state.state==='Halted' || state.state==='Running')result.targetState=state.state;
+      else if(typeof state.dhcsr==='number')result.targetState=state.dhcsr&0x20000?'Halted':'Running';
+      return result;
+    },{priority:'control'}); }
     catch(error) {
       const response=error as {httpStatus?:number;errorCode?:string};
       if(response.httpStatus && response.httpStatus<500)return this.failure(String(error),response.errorCode || 'RMLinkRequestFailed');

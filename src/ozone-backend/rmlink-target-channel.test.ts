@@ -17,6 +17,8 @@ class ClientModel {
     if(this.rejectOnce){this.rejectOnce=false;throw Object.assign(new Error('invalid register'),{httpStatus:400,errorCode:'InvalidRequest'});}
     if(command==='read_memory')return {data:'78563412'};
     if(command==='state')return {state:'Running'};
+    if(command==='halt' || command==='step')return {command,dhcsr:0x30003};
+    if(command==='run')return {command,dhcsr:0x10001};
     if(command==='read_register')return {value:0x08000100};
     return {};
   }
@@ -30,6 +32,15 @@ class ClientModel {
   }
 }
 describe('RMLink public-service owner',()=>{
+  it('preserves observed Cortex-M control state through the service owner contract',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+    expect((await owner.halt()).targetState).toBe('Halted');
+    expect((await owner.step()).targetState).toBe('Halted');
+    expect((await owner.run()).targetState).toBe('Running');
+    expect((await owner.getState()).targetState).toBe('Running');
+    await owner.dispose();
+  });
   it('selects exactly one service owner and never constructs a competing probe',async()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     const forbidden=()=>{throw new Error('competing probe');};
